@@ -46,7 +46,7 @@ Composites recurse: a child UoW may itself be composite, expanding into grandchi
 Same split as LangGraph (state = data with reducers; transition = movement) — but simpler.
 
 - **State** is the NODE tree. Each NODE has one channel that drives transitions: `phase`. (`brief`, `derivation`, `children`, `dependencies` are content carried alongside; they don't drive phase changes.)
-- **Transition** is one pure function: `transition(node, signal) → {nextNode, sideEffects}`. No graph definition, no node functions, no conditional edges. The function reads from a small declarative table.
+- **Transition** is one pure function: `transition(node, signal) → {node, effects}`. No graph definition, no node functions, no conditional edges. The function reads from a small declarative table.
 
 LangGraph's machinery (subgraphs, ephemeral checkpoint namespaces, type leakage — see handbook issue #4) is rejected. Native TypeScript covers our needs with one pure function and a table.
 
@@ -141,23 +141,23 @@ const TRANSITIONS: TransitionRule[] = [
   { from: "Working",      signal: "eval",         kind: "terminal",  to: "Evaluating" },
   { from: "Working",      signal: "children-done",kind: "composite", to: "Evaluating" },
   { from: "Evaluating",   signal: "eval",         to: "Completed" },
-  // Deferred → Initializing handled in side effects (see Composite NODEs)
+  // Deferred → Initializing handled in effects (see Composite NODEs)
 ];
 ```
 
 Why a table:
 
 - **Auditable** — readers see the entire state machine at a glance.
-- **Pure** — `transition(node, signal)` returns the same `{nextNode, sideEffects}` for the same inputs.
+- **Pure** — `transition(node, signal)` returns the same `{node, effects}` for the same inputs.
 
 `$new` is a virtual phase representing "NODE doesn't exist yet."
 
-### Side effects
+### Effects
 
-The transition function returns side effects alongside the next NODE. Side effects are data, applied by the application layer:
+The transition function returns effects alongside the next node. Effects are data, applied by the application layer:
 
 ```ts
-type SideEffect =
+type Effect =
   | { type: "storeBrief"; brief: unknown }
   | { type: "storePlan"; plan: unknown }
   | { type: "storeWork"; work: unknown }
@@ -166,7 +166,7 @@ type SideEffect =
   | { type: "promoteEligible"; parentId: NodeId };  // Deferred → Initializing for ready children
 ```
 
-Side effects update content, not phase. Phase moves come from the table; content moves come from side effects. Both are pure data; the application's use case applies them and writes one atomic checkpoint.
+Effects update content, not phase. Phase moves come from the table; content moves come from effects. Both are pure data; the application's use case applies them and writes one atomic checkpoint.
 
 ## Composite NODEs
 
@@ -269,7 +269,7 @@ Two implementations ship (per `D18`):
    ┌──────────────────────────────────┐
    │  Domain (pure)                   │
    │    transition(node, signal) →    │
-   │      {nextNode, sideEffects}     │
+   │      {node, effects}     │
    └──────────────────────────────────┘
                 ▲
                 │ uses
@@ -309,7 +309,7 @@ sequenceDiagram
     C->>UC: SubmitSignal(id, initialize, brief)
     UC->>CP: load(id) → null
     UC->>Dom: transition($new, initialize)
-    Dom-->>UC: {nextNode: Initializing, [storeBrief]}
+    Dom-->>UC: {node: Initializing, [storeBrief]}
     UC->>CP: save(node)
     UC-->>C: node
 
@@ -380,8 +380,8 @@ sequenceDiagram
 ## Invariants
 
 - **I-1.** Domain imports nothing outside `src/domain/`.
-- **I-2.** `transition` is pure: same `(node, signal)` → same `{nextNode, sideEffects}`.
-- **I-3.** A signal is either fully applied (saved with all side effects) or fully rejected. No partial state change.
+- **I-2.** `transition` is pure: same `(node, signal)` → same `{node, effects}`.
+- **I-3.** A signal is either fully applied (saved with all effects) or fully rejected. No partial state change.
 - **I-4.** Every NODE id is `[a-z0-9-]+(?:/[a-z0-9-]+)*` and is fixed at creation.
 - **I-5.** Sibling keys are unique within a parent. Sibling dependencies form a DAG.
 - **I-6.** A composite advances `Working → Evaluating` only when every child is `Completed`.
@@ -391,7 +391,7 @@ sequenceDiagram
 
 ## Tests we expect
 
-- **Domain tests** — `transition` against a table of `(phase, signal, kind) → {phase, sideEffects}` cases. No I/O.
+- **Domain tests** — `transition` against a table of `(phase, signal, kind) → {phase, effects}` cases. No I/O.
 - **Use-case tests** — `SubmitSignal` end-to-end with `MemoryCheckpointer`. Drive a terminal NODE through the happy path; drive a composite with multi-child dependencies through expansion and completion.
 - **Adapter contract tests** — same suite run against `MemoryCheckpointer` and `SqliteCheckpointer`. Both must pass.
 
