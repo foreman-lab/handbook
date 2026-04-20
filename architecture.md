@@ -31,6 +31,23 @@ Each becomes its own architecture doc when work begins on it.
 
 ## Domain
 
+### State and transition (the model)
+
+We split the state machine into two ideas, the same way LangGraph does — but simpler.
+
+**State** is data. In LangGraph, state is a typed dictionary of *channels*, each with a reducer function that says how updates merge. Multiple channels coexist; reading state means reading the current value of every channel.
+
+**Transition** is movement. In LangGraph, transition is the *graph* — edges between named *nodes*, where each node is a function that returns a partial state update. The graph decides what runs next based on the current state.
+
+The basic Playbook version simplifies both:
+
+- **State** is one channel: `phase`. (`brief` and `derivation` are content carried alongside, but they don't drive transitions.)
+- **Transition** is one pure function: `transition(node, signal) → node`. No graph definition, no node functions, no conditional edges.
+
+We pay the LangGraph tax (subgraph quirks, ephemeral checkpoint namespaces, type leakage — see handbook issue #4) only when the engine actually needs that machinery. The basic version doesn't.
+
+When features land — composite children, retries, blocks — state grows more channels and the transition function grows more rules. The model stays the same: **state is data; transition is the function that moves it.**
+
 ### Phases
 
 ```ts
