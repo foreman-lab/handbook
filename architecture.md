@@ -85,25 +85,38 @@ type Node = {
 
 ### Transition
 
-One pure function.
+The transition function is a **table interpreter**, not a switch. The table is data; the function reads it.
 
 ```ts
-function transition(node: Node, signal: Signal): Node;
+const TRANSITIONS = [
+  { from: "Initializing", signal: "plan", to: "Planning"   },
+  { from: "Planning",     signal: "work", to: "Working"    },
+  { from: "Working",      signal: "eval", to: "Evaluating" },
+  { from: "Evaluating",   signal: "auto", to: "Completed"  },
+] as const;
+
+function transition(node: Node, signal: Signal): Node {
+  const rule = TRANSITIONS.find(
+    (r) => r.from === node.phase && r.signal === signal.type,
+  );
+  if (!rule) throw new InvalidTransitionError(node.phase, signal.type);
+  return {
+    ...node,
+    phase: rule.to,
+    derivation: { ...node.derivation, [signal.type]: signal.payload },
+  };
+}
 ```
 
-Maps `(phase, signal)` to `nextPhase` and stores the signal's payload into `derivation`. Throws on invalid combinations (wrong signal for current phase, signal applied to a `Completed` NODE, etc.).
+Why a table, not a switch:
 
-The valid transitions:
+- The table is **auditable** — readers see the entire state machine at a glance.
+- The table is **swappable** — when the engine needs to support multiple UoW patterns later (PDCA, PGE, custom), the table becomes a parameter and the engine doesn't change. See *Future direction (deferred)* below.
+- The function stays **pure**: same `(node, signal)` → same result.
 
-| From | Signal | To |
-|---|---|---|
-| (NODE doesn't exist) | `initialize` | `Initializing` |
-| `Initializing` | `plan` | `Planning` |
-| `Planning` | `work` | `Working` |
-| `Working` | `eval` | `Evaluating` |
-| `Evaluating` | (auto) | `Completed` |
+For the basic version, the table is hardcoded with one entry per phase. The `initialize` signal is a special case (no `from` phase): if `Checkpointer.load(nodeId)` returns `null`, the use case creates the NODE in `Initializing` directly.
 
-The `Evaluating → Completed` step is automatic in the basic version: any `eval` signal completes the NODE. The richer outcome policy (pass/retry/capped/blocked) is a later feature.
+The `Evaluating → Completed` step is automatic: any `eval` signal completes the NODE. The richer outcome policy (pass/retry/capped/blocked) is a later feature (see "Out of scope" above).
 
 ## Application layer
 
@@ -231,6 +244,21 @@ Module is testable in isolation:
 - **Domain tests** — `transition` against a table of `(phase, signal) → phase` cases. No I/O, no mocks.
 - **Use-case tests** — `SubmitSignal` with `MemoryCheckpointer`. Assert NODE state after each signal.
 - **Adapter contract tests** — same suite run against `MemoryCheckpointer` and `SqliteCheckpointer`. Both must pass.
+
+## Future direction (deferred)
+
+The transition function reads from a table. That shape isn't accidental — it pre-positions the engine for a future where the table becomes **swappable per NODE**.
+
+In a future version, each NODE could carry a `patternId` referencing a `UoWPattern` (e.g., `pwe@1`, `pdca@1`, `pge@1`, or user-defined). The engine would resolve the pattern at signal time and read its table. The transition function's signature evolves from `(node, signal) → node` to `(node, signal, pattern) → node`. The basic 4-phase machine becomes one registered pattern (`pwe@1`); nothing else in the engine changes.
+
+This direction is **deferred** — it's added when:
+- Composite NODEs work with the basic 4 phases, AND
+- A second pattern is genuinely demanded by a real user or craft (PDCA, PGE, or domain-specific), AND
+- The journal/replay layer is in place.
+
+Until then: one hardcoded table, one phase set, one pattern. Speculative generality is rejected (`D18`).
+
+The full design exploration (recursive UoW, manifest-based composite expansion, lazy children, path-based stable IDs that avoid the LangGraph ADR 0004 trap) lives in [handbook issue #7](https://github.com/foreman-lab/handbook/issues/7).
 
 ## How this changes
 
