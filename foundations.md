@@ -50,7 +50,7 @@ Foreman has two kinds of principles: how we build the project (`B*`), and what t
 
 **D6. `MCP` SDK behind one adapter.** Every call to `@modelcontextprotocol/sdk` lives in a single directory. The SDK is pinned to an exact version. When it breaks, one file changes.
 
-**D7. Playbooks ride inside briefs.** The harness never reads playbook files at runtime. Agents embed the full playbook contract in the initialization signal. No `playbooks/` directory in the engine.
+**D7. Playbook and craft are different things.** A `playbook` is the outer workflow — the NODE tree the user authors for a task. A `craft` is an inner practice — domain how-to for one kind of work (TDD, refactor, review, etc.) that a single NODE invokes. A playbook references crafts; crafts do not reference playbooks. Crafts ride inside per-NODE briefs; the harness never reads craft or playbook files at runtime. Agents render prompts from the brief payload.
 
 **D8. Transport, handler, flow are three layers.** Transport validates and forwards. Handlers translate signals to flow commands. Flow runs the state machine. Cross-layer imports fail the build.
 
@@ -70,13 +70,17 @@ Foreman has two kinds of principles: how we build the project (`B*`), and what t
 
 **D16. Naming: product name on external surfaces only.** `foreman` appears in the CLI binary, `MCP` tool names, env var prefix, and config file names. Internal types, classes, and functions use neutral names. The import path is the namespace.
 
-**D17. Domain vocabulary is locked.** `node`, `brief`, `playbook`, `plan`, `work`, `evaluation`, `outcome`, `block`, `journal`, `checkpoint`, `operator`, `agent`, `harness`. Synonyms drift; we reject them at review.
+**D17. Domain vocabulary is locked.** `node`, `brief`, `playbook`, `craft`, `plan`, `work`, `evaluation`, `outcome`, `block`, `journal`, `checkpoint`, `operator`, `agent`, `harness`. Synonyms drift; we reject them at review. `playbook` and `craft` must not be conflated (see D7).
 
 **D18. No premature ports.** We add an outbound port only when real variation exists across tiers or tests, or when an alternate implementation is landing next. Ceremony interfaces with one implementation are rejected.
 
 **D19. Vitest, ESLint, Prettier, GitHub Actions.** Standard TypeScript toolchain. CI gates: typecheck, test, lint, format.
 
 **D20. Tier orchestration follows the Docker model.** Each tier wraps the tier below by speaking its wire protocol, not by linking to its code. Solo is `foreman` itself (foreground or daemon mode). Team is a LAN host that routes `MCP`/IPC to per-user `foreman` instances. Cloud is a multi-tenant supervisor that spawns tenant daemons. Any tier can be rewritten in another language without touching the layers below, the same way `docker compose` does not share a codebase with `dockerd`, and `kubernetes` does not share one with either. Concretely: `foreman` stays self-contained, core is never extracted, the wire protocol is the only contract.
+
+**D21. CLI is a thin `MCP` client.** The `foreman` CLI translates user commands into `MCP` calls against the daemon (local and in-process in foreground mode; long-running over a socket in daemon mode). No orchestration logic in the CLI. It is a transport sibling to `MCP` stdio, not a second surface with its own rules. Agents and CLI are peer clients of the same engine.
+
+**D22. Persistence is a port.** The `Checkpointer` interface is the contract between the engine and storage. `MemoryCheckpointer` and `SqliteCheckpointer` ship with foreman; users may bring their own (Postgres, file, encrypted, git-backed). The engine owns `NodeState` shape; adapters own storage format. A NODE's journal lives inside its checkpoint — one atomic write per transition, no dual-store consistency problem.
 
 ## How this changes
 
