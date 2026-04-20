@@ -242,6 +242,40 @@ deriveOutcome({security, authenticity, quality}, iterations): "completed" | "ret
 
 Policy lives in the engine. Agents report facts; the engine decides verdicts. Matches `P1` (harness, not agent).
 
+### Bounded iteration (the Ralph loop)
+
+When gates fail, the agent gets another try — with the failed report in hand. This is the Ralph loop: retry-with-feedback, bounded by a cap.
+
+**Mechanics**
+
+- Each NODE starts at `iteration: 1`.
+- On an `eval` signal with failing gates AND `iteration < cap` → `deriveOutcome` returns `retry`.
+- `retry` transitions `Evaluating → Working`. The `incrementIteration` action bumps the counter.
+- When `iteration == cap` on a failing eval → `deriveOutcome` returns `capped` → transitions `Evaluating → Blocked` with `block.category: "capped"`.
+
+**Feedback carry-over**
+
+On retry, the NODE's next `work` brief includes:
+
+- `previousReport` — what the agent produced last time (`derivation.report`).
+- `previousGates` — the gate findings that failed (`derivation.gates`).
+
+The agent reads these from the brief and adjusts. No hidden state, no separate signal; the feedback is just data on the brief.
+
+**Default cap**
+
+3 iterations per NODE. A craft may declare its own cap for the NODEs that invoke it (craft-level override, 0.2.0+).
+
+**Capped goes to Blocked, not Failed**
+
+Hitting the cap is never an automatic failure. The NODE enters `Blocked` with category `"capped"` so the operator decides:
+
+- Bump the cap and resume — "one more try."
+- Swap the craft and re-plan — "wrong approach."
+- Fail the NODE — "not worth continuing."
+
+Capping is a handoff to the operator, not a verdict.
+
 ### Effective state
 
 For a composite NODE, the stored `phase` may be `Working` while its children are still running. Dependency-waiting NODEs stay `Deferred` until their deps finish. The engine computes **effective state** on demand:
@@ -484,7 +518,52 @@ sequenceDiagram
     Note over Boot: State is "snapshot + all committed<br/>journal entries up to crash".
 ```
 
-These four cover init/cycle, block/resolve, composite expansion, and recovery. Parallel-child flows will get their own diagram when structured concurrency ships.
+### Flow E: Ralph loop (bounded retry)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Ag as Agent
+    participant MCP as MCP server
+    participant UC as SubmitSignal
+    participant Dom as domain.transition
+    participant Out as deriveOutcome
+    participant JR as Journal
+    participant CP as Checkpointer
+
+    Note over Ag,CP: iteration 1 — gates fail
+
+    Ag->>MCP: playbook__step(work, iter 1)
+    UC->>Dom: transition(Planning, work)
+    Dom-->>UC: {Working, [storeReport]}
+    UC->>CP: save
+
+    Ag->>MCP: playbook__step(eval, iter 1 gates)
+    UC->>Dom: transition(Working, eval)
+    Dom->>Out: deriveOutcome(gates, iteration=1, cap=3)
+    Out-->>Dom: "retry"
+    Dom-->>UC: {Working, [incrementIteration]}
+    UC->>JR: append
+    UC->>CP: save
+    UC-->>MCP: {ok, phase: Working, iteration: 2, feedback}
+
+    Note over Ag: Agent fetches brief — includes<br/>previousReport + previousGates
+
+    Ag->>MCP: playbook__step(work, iter 2)
+    Note over UC,CP: store new report
+
+    Ag->>MCP: playbook__step(eval, iter 2 gates)
+    UC->>Dom: transition(Working, eval)
+    Dom->>Out: deriveOutcome(gates, iteration=2, cap=3)
+    Out-->>Dom: "completed"
+    Dom-->>UC: {Completed, [storeEval]}
+    UC->>CP: save
+    UC-->>MCP: {ok, phase: Completed}
+
+    Note over Ag,CP: Alt: if iteration==3 and gates fail,<br/>outcome="capped" → Blocked<br/>(operator decides: bump cap, swap craft, or fail)
+```
+
+These five cover init/cycle, block/resolve, composite expansion, recovery, and the Ralph loop. Parallel-child flows will get their own diagram when structured concurrency ships.
 
 ## Composition root
 
