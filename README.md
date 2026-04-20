@@ -8,7 +8,6 @@ Architecture, ADRs, and roadmap for [Foreman](https://github.com/foreman-lab/for
 - [`roadmap.md`](roadmap.md) — Product tier progression (solo → team → cloud) and activation tripwires.
 - [`architecture.md`](architecture.md) — Core architecture: state machine, layers, signal protocol, invariants.
 - [`adr/`](adr/) — Architecture Decision Records (0001–0009).
-- [`phase-1-solo/`](phase-1-solo/) — Historical trial material (pending cleanup, see note below).
 
 ## Reading order
 
@@ -24,7 +23,6 @@ Architecture, ADRs, and roadmap for [Foreman](https://github.com/foreman-lab/for
 This handbook was seeded from a prior trial repo. Cleanup PRs are landing to:
 
 - Strip milestone-specific (M0–M6) references from `architecture.md`, `error-codes.md`, `dogfooding-protocol.md`.
-- Remove trial artifacts under `phase-1-solo/` (milestone proposals, evaluations, trial spec).
 - Rewrite passages referring to `@foreman-lab/core` extraction — the new direction is **tiers-as-wire-protocol** (Docker model): higher tiers speak Foreman's MCP/IPC, they do not import core.
 - Add new docs: `tiers-as-wire-protocol.md`, `binary-modes.md`, `solo-mode.md`.
 
