@@ -1,34 +1,12 @@
 # handbook
 
-Architecture, ADRs, and roadmap for [Foreman](https://github.com/foreman-lab/foreman) — an MCP harness for AI coding agents.
-
-## What's here
-
-- [`foundations.md`](foundations.md) — Foundational principles (P-1..P-10) and decisions (D-1..D-20). Locked baseline.
-- [`roadmap.md`](roadmap.md) — Product tier progression (solo → team → cloud) and activation tripwires.
-- [`architecture.md`](architecture.md) — Core architecture: state machine, layers, signal protocol, invariants.
-- [`adr/`](adr/) — Architecture Decision Records (0001–0009).
-- [`phase-1-solo/`](phase-1-solo/) — Historical trial material (pending cleanup, see note below).
-
-## Reading order
-
-1. [`foundations.md`](foundations.md) — the constitutional layer.
-2. [`roadmap.md`](roadmap.md) — product tiers and progression.
-3. [`architecture.md`](architecture.md) — the state machine + layer architecture.
-4. [`adr/0001-architectural-style-declaration.md`](adr/0001-architectural-style-declaration.md) — the 7-pattern hybrid.
-5. [`adr/0007-domain-blind-core.md`](adr/0007-domain-blind-core.md) — foreman composes prompt sections; agents render.
-6. [`adr/0009-foreman-composes-prompt-sections-and-lazy-children.md`](adr/0009-foreman-composes-prompt-sections-and-lazy-children.md) — 6-section composition + lazy-load.
+Architecture reference for [Foreman](https://github.com/foreman-lab/foreman) — an MCP harness for AI coding agents.
 
 ## Status
 
-This handbook was seeded from a prior trial repo. Cleanup PRs are landing to:
+Empty. Being redesigned step by step. Each doc lands as a separate PR when it's ready.
 
-- Strip milestone-specific (M0–M6) references from `architecture.md`, `error-codes.md`, `dogfooding-protocol.md`.
-- Remove trial artifacts under `phase-1-solo/` (milestone proposals, evaluations, trial spec).
-- Rewrite passages referring to `@foreman-lab/core` extraction — the new direction is **tiers-as-wire-protocol** (Docker model): higher tiers speak Foreman's MCP/IPC, they do not import core.
-- Add new docs: `tiers-as-wire-protocol.md`, `binary-modes.md`, `solo-mode.md`.
-
-See the repo's issue tracker for the cleanup backlog.
+The prior trial at `../foreman` (kept locally, outside this org) is the historical reference for the material this repo once seeded.
 
 ## License
 
