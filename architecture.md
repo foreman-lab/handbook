@@ -6,17 +6,17 @@ Tied to [`foundations.md`](foundations.md).
 
 ## The model
 
-A **state** is a label for a position. Any string. Caller-defined.
+A **state** is a node in the graph — an identified position with optional metadata (is it terminal, and — later — entry/exit actions, timeouts). Caller-defined.
 
-A **state node** is a state plus metadata (is it terminal, and — later — entry/exit actions, timeouts). In graph terms, the vertex.
+A **state id** (`StateId`) is a string identifier that references a state within a definition. It's scoped to its definition: the id `"Planning"` under one definition is a different state than `"Planning"` under another. Machines always carry their `definitionId` + `definitionVersion` alongside their current state id, so resolution is unambiguous.
 
 An **event** is an input to the machine: a type and an opaque payload.
 
-A **transition** is a rule mapping `(from state, event type) → to state`. In graph terms, the edge.
+A **transition** is a rule mapping `(from state id, event type) → to state id`. In graph terms, the edge.
 
-A **machine definition** is the full graph: initial state, state nodes, transitions. Identified by `(id, version)` the caller chooses (semver, hash, anything).
+A **machine definition** is the full graph: initial state id, the set of states, and the transitions. Identified by `(id, version)` the caller chooses (semver, hash, anything).
 
-A **machine** is a stateful entity traversing a graph. Has an id, current state, context, a caller-owned `meta` bag, a reference to the definition it runs under (`definitionId`, `definitionVersion`), and a `revision` counter for optimistic concurrency.
+A **machine** is a stateful entity traversing a graph. Has an id, a current state id, context, a caller-owned `meta` bag, a reference to the definition it runs under (`definitionId`, `definitionVersion`), and a `revision` counter for optimistic concurrency.
 
 The engine maintains a **definition catalog** that grows over time. Definitions are **persisted** in the store, **registered** into the catalog at runtime, and **loaded lazily** when a machine needs one.
 
@@ -32,7 +32,7 @@ The engine's job is fixed: "advance one machine's state when an event arrives, u
 
 - Generic single-machine finite state machine per dispatch.
 - Caller-defined states (any string set) and event types (any string set).
-- First-class machine definitions: initial state, state nodes, transitions.
+- First-class machine definitions: initial state, states (nodes), transitions.
 - **Definition catalog** — many definitions per engine.
 - **Runtime registration** — new definitions added while the engine runs.
 - **Lazy loading** — definitions load from the store on demand.
@@ -72,7 +72,7 @@ The basic engine simplifies both:
 ### Generic types
 
 ```ts
-type State = string;
+type StateId = string;              // reference/pointer to a State within a definition
 
 type Event = {
   type: string;
@@ -81,25 +81,25 @@ type Event = {
 // Callers MAY define a superset of Event (e.g., add `timestamp`, `correlationId`)
 // as long as `type` and `payload` remain present. The engine reads only those two.
 
-type StateNode = {
-  id: State;
+type State = {
+  id: StateId;
   terminal?: boolean;
   meta?: Record<string, unknown>;   // caller-owned; engine never reads
   // future (feature-specific): entry?, exit?, timeout?
 };
 
 type Transition = {
-  from: State;
+  from: StateId;                    // points to State.id in the same definition
   event: string;
-  to: State;
+  to: StateId;
   meta?: Record<string, unknown>;   // caller-owned; engine never reads
 };
 
 type MachineDefinition = {
   id: string;
   version: string;
-  initialState: State;
-  states: StateNode[];
+  initialState: StateId;            // points to one of states[].id
+  states: State[];
   transitions: Transition[];
 };
 
@@ -108,7 +108,7 @@ type Machine = {
   definitionId: string;
   definitionVersion: string;
   revision: number;                 // starts at 0; engine increments on each save
-  state: State;
+  state: StateId;                   // points to a State in definition.states
   context: Record<string, unknown>;
   meta: Record<string, unknown>;    // caller-owned; engine never reads
 };
@@ -134,7 +134,7 @@ function transition(
 ): Machine;
 ```
 
-Throws if no row matches, or if `machine.state` is a terminal node.
+Throws if no row matches, or if the `State` identified by `machine.state` is marked terminal.
 
 The engine resolves `definition` on each dispatch by looking up the machine's `definitionId` and `definitionVersion` in the catalog, loading from the store lazily if not already cached.
 
@@ -351,7 +351,7 @@ The engine is deliberately minimal. Every future capability extends through one 
 1. **Generic types.** States, events, context, and metadata are all caller-defined data. The engine carries them, never interprets them.
 2. **Open event envelope.** `Event` requires `{type, payload}`. Callers may carry extra fields (`timestamp`, `correlationId`, `source`, etc.) by declaring a superset type in their own code. The engine reads only `type` and `payload`; it neither validates nor strips the rest.
 3. **`Store` as a port.** Any adapter that satisfies the interface works. Callers can **wrap** the port (decorator pattern) to add logging, metrics, encryption, retry, or caching without touching the engine or its shipped adapters.
-4. **Caller-owned `meta`, everywhere.** Machines, state nodes, and transitions all carry `meta: Record<string, unknown>`. The engine never reads or writes their contents. Use them for: machine iteration counters and deadlines, state display names / descriptions / icons / colors for UIs, transition labels and reasons for operator docs — anything specific to the caller's domain.
+4. **Caller-owned `meta`, everywhere.** Machines, states, and transitions all carry `meta: Record<string, unknown>`. The engine never reads or writes their contents. Use them for: machine iteration counters and deadlines, state display names / descriptions / icons / colors for UIs, transition labels and reasons for operator docs — anything specific to the caller's domain.
 5. **Declared future ports.** The Out-of-scope list names the expected extension hooks (`Router`, `Actions`, `Guards`, `Subscriber`). Each becomes an optional port when it ships. Engines constructed without these ports fall back to the basic behavior; engines constructed with them gain the feature. Backward-compatible by construction.
 6. **Immutable bedrock.** The types, ports, and invariants documented here are the stable API. New ports are added in minor versions; fields can be added in minor versions; renames and removals require a major version and an ADR. Callers can rely on this contract.
 
@@ -359,7 +359,7 @@ The engine is deliberately minimal. Every future capability extends through one 
 
 Pull-style integrations (GraphQL, REST, CLI listing, documentation generators, diagram exporters) are **adapters around `Store`**, not engine changes. The store exposes `loadDefinition(id, version)` and `loadMachine(id)`; those are enough to serve any read API. Push-style integrations (dashboards, live timelines) use the future `Subscriber` port for transition events.
 
-For runtime-growing systems where users author many definitions, `StateNode.meta` and `Transition.meta` carry the display-layer data the engine refuses to invent — names, descriptions, icons, documentation links, whatever the UI needs. The engine persists them as opaque bags; the UI reads them through its adapter.
+For runtime-growing systems where users author many definitions, `State.meta` and `Transition.meta` carry the display-layer data the engine refuses to invent — names, descriptions, icons, documentation links, whatever the UI needs. The engine persists them as opaque bags; the UI reads them through its adapter.
 
 What this rules out (deliberately):
 
@@ -374,8 +374,8 @@ What this rules out (deliberately):
 - **I-3.** An event is either applied (machine saved) or rejected (no state change).
 - **I-4.** Every outbound port has ≥2 implementations.
 - **I-5.** No `any` in domain; Zod gates every event's and definition's shape.
-- **I-6.** Engine never reads `payload`, `context`, `Machine.meta`, `StateNode.meta`, or `Transition.meta` content. They pass through unchanged.
-- **I-7.** Engine never reads state labels for semantics; it only compares them as strings.
+- **I-6.** Engine never reads `payload`, `context`, `Machine.meta`, `State.meta`, or `Transition.meta` content. They pass through unchanged.
+- **I-7.** Engine never reads `StateId` values for semantics; it only compares them as strings. Resolution to `State` objects is always scoped by `(definitionId, definitionVersion)`.
 - **I-8.** Every machine carries `(definitionId, definitionVersion)`. Dispatch uses that exact version; no silent upgrades.
 - **I-9.** `saveDefinition` and `registerDefinition` are idempotent on `(id, version)`.
 - **I-10.** The catalog is a cache: any entry must be reconstructible from the store. Clearing the catalog never loses data.
@@ -387,7 +387,7 @@ What this rules out (deliberately):
 - **Use-case tests** — `registerDefinition`, `startMachine`, `dispatch` with `MemoryStore`.
 - **Adapter contract tests** — run against `MemoryStore` and `SqliteStore`. Cover definition save/load, machine save/load, idempotent definition save, optimistic concurrency conflict.
 - **Payload-opacity tests** — round-trip arbitrary payload shapes.
-- **State-opacity tests** — configure with arbitrary random state labels; behavior unchanged.
+- **State-opacity tests** — configure with arbitrary random `StateId`s; behavior unchanged.
 - **Event-envelope extensibility tests** — dispatch events with extra fields beyond `{type, payload}`; assert the engine ignores them.
 - **Lazy-loading tests** — dispatch a machine whose definition is only in the store; catalog populates from the store once.
 - **Runtime-registration tests** — start with empty catalog; register at runtime; dispatch against it.
