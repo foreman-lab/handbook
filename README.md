@@ -5,6 +5,7 @@ Architecture reference for [Playbook](https://github.com/foreman-lab/playbook) �
 ## What's here
 
 - [`foundations.md`](foundations.md) — Foundational principles (B1–B3 build, P1–P10 product) and decisions (D1–D22). The constitutional baseline.
+- [`architecture.md`](architecture.md) — State machine architecture (hexagonal layers, domain types, ports, adapters, invariants).
 
 ## Status
 
