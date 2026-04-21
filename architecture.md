@@ -1,54 +1,44 @@
 # State Machine — Basic
 
-The minimum playable state machine module for Playbook. One unit of work, five states, linear progression. This is the bedrock; every feature (composition, blocks, retry, operators, journal, recovery) is added on top in later architecture docs.
+A generic state machine module. Opaque to domain. Configured at construction with a state set, a signal set, transition rules, and optional ports. Playbook is one caller; the engine knows nothing about Playbook's 4-phase lifecycle, crafts, briefs, or any other domain term.
 
 Tied to [`foundations.md`](foundations.md).
 
 ## The model
 
-A **state** is a position in the lifecycle: `Initializing`, `Planning`, `Working`, `Evaluating`, `Completed`. In graph terms, each state is a node.
+A **state** is a label for a position. Any string. Caller-defined.
 
-A **unit of work** (or just **unit**) is one traversal of the lifecycle — 5 states, bound by a shared identity. The unit is the composable entity.
+A **signal** is an input to the machine: a type and an opaque payload.
 
-Two composition modes will exist (both deferred to later docs):
+A **unit** is a stateful entity that traverses states by receiving signals.
 
-- **Pipe** — sequential chain of units: `Unit A → Unit B → Unit C`. Unit B starts when Unit A reaches `Completed`.
-- **Expand** — a unit's `Working` state expands into a subtree of children units. The parent's `Working` completes when all children reach `Completed`.
+A **transition** moves a unit from one state to another. Rules are declarative data; an optional policy port handles dynamic branches.
 
-**Recursion is native.** Every child is itself a unit — same 5 states, same 4 signals, same shape. A child may be leaf (its `Working` does the actual work) or composite (its `Working` expands further). Depth is unbounded; the engine treats every level identically.
-
-**Traversal is depth-first.** When expansion ships, sibling N+1 starts only after sibling N's full subtree reaches `Completed`. At any moment one unit is active along a single path from root. Parallel children — where siblings under one parent run concurrently — is an opt-in variant (out-of-scope item 9).
-
-**Signals are uniform.** Every signal has the same shape: `{ type, payload: unknown }`. The engine routes by `type`; payloads pass through unread. This makes design easy: one signal handler, one validation shape, one test pattern across all four states.
-
-The basic version runs **one unit, linearly, no composition.** A root unit where `Working` is leaf. Everything else — pipe, expand, nested composites, parallel children — is future work that extends this shape without changing it.
+The engine treats state, signal types, and payloads as opaque. It routes, stores, and persists — the caller interprets.
 
 ## Scope
 
 **In**
 
-- One unit at a time. No pipes, no expansion.
-- Five states, linear: `Initializing → Planning → Working → Evaluating → Completed`.
-- Four signals, one per state advance.
-- Opaque payloads — the engine routes, doesn't interpret.
+- Generic single-unit finite state machine.
+- Caller-defined states (any string set).
+- Caller-defined signal types (any string set).
+- Caller-defined transition rules as data.
+- Opaque payloads on signals; engine never reads content.
 - One outbound port: `Checkpointer` (save / load unit).
 - One use case: `SubmitSignal`.
 
-**Out (added in later docs, in order)**
+**Out (added in later docs)**
 
-1. Failure terminal (`Failed`) and outcome derivation.
-2. Blocks and operator unblock.
-3. Ralph loop (bounded retry with feedback).
-4. **Pipe** — sequential composition of units.
-5. **Expand** — composite unit whose `Working` is a subtree of child units.
-6. Journal and replay (crash recovery).
-7. Effective state (computed across the unit tree).
-8. Checkpoint / restore (operator-triggered).
-9. Parallel children (structured concurrency).
-10. Engine-generated signals (preflight, integrity).
-11. Transport layers (MCP, CLI).
+1. **Policy hook** — caller-provided `OutcomePolicy` port for dynamic transitions (enables retry loops, blocks, aggregate joins, approval gates, timeouts — all as caller compositions).
+2. **Entry actions** — rule-declared actions run after transition; handlers caller-provided.
+3. **Metadata bucket** — caller-owned `Record<string, unknown>` on the unit, for counters / deadlines / approvals / anything the engine shouldn't interpret.
+4. **Tree composition** — pipe (sequential units) and expand (composite with children). App-level orchestration; the engine stays single-unit.
+5. **Journal and replay** — crash-recovery log alongside the checkpoint.
+6. **Parallel step processing** — concurrent units under structured concurrency.
+7. **Transport layers** — MCP, CLI, or any adapter that translates inbound calls into `SubmitSignal` invocations.
 
-Each becomes its own architecture doc when work begins on it.
+Each gets its own architecture doc when its turn comes.
 
 ## Domain
 
@@ -58,88 +48,60 @@ We split the state machine into two ideas, the same way LangGraph does — but s
 
 **State** is data. In LangGraph, state is a typed dictionary of *channels*, each with a reducer function that says how updates merge. Multiple channels coexist; reading state means reading the current value of every channel.
 
-**Transition** is movement. In LangGraph, transition is the *graph* — edges between named *nodes*, where each node is a function that returns a partial state update. The graph decides what runs next based on the current state.
+**Transition** is movement. In LangGraph, transition is the *graph* — edges between named *nodes*, where each node is a function that returns a partial state update. The graph decides what runs next.
 
-The basic Playbook version simplifies both:
+The basic engine simplifies both:
 
-- **State** is one channel: `state` (the position). (`derivation` carries content alongside but does not drive transitions.)
-- **Transition** is one pure function: `transition(unit, signal) → unit`. No graph definition, no node functions, no conditional edges.
+- **State** is one channel: `state` (the position). `derivation` carries content alongside but does not drive transitions.
+- **Transition** is one pure function: `transition(unit, signal) → unit`. Rules are a flat table; no graph definition, no node functions, no conditional edges.
 
-We pay the LangGraph tax (subgraph quirks, ephemeral checkpoint namespaces, type leakage — see handbook issue #4) only when the engine actually needs it. The basic version doesn't.
+Pay the LangGraph tax (subgraph quirks, ephemeral checkpoint namespaces, type leakage — see handbook issue #4) only when the engine actually needs it. The basic version doesn't.
 
-When features land — pipe, expand, retry, blocks — more channels join the state and more rules join the transition function. The model stays the same: **state is data; transition is the function that moves it.**
-
-### States
+### Generic types
 
 ```ts
-type State = "Initializing" | "Planning" | "Working" | "Evaluating" | "Completed";
-```
+type State = string;                   // caller-defined label
 
-`Completed` is terminal. The basic version has no other terminal state.
+type Signal = {
+  type: string;                        // caller-defined signal type
+  payload: unknown;                    // opaque to engine
+};
 
-### Signals
-
-The engine is a library; payloads are opaque. The engine knows the signal **type** (which state advance it triggers). It doesn't know what's inside `payload`.
-
-```ts
-type Signal =
-  | { type: "initialize"; payload: unknown }
-  | { type: "plan"; payload: unknown }
-  | { type: "work"; payload: unknown }
-  | { type: "eval"; payload: unknown };
-```
-
-Discriminated union, validated by Zod (`D3`) for shape (`type` is one of 4, `payload` exists). *What's in* `payload` is the caller's concern — the engine stores it and hands it back on read.
-
-The basic version has no block, resolve, or override signals.
-
-### Unit shape
-
-```ts
 type Unit = {
   id: string;
   state: State;
-  derivation: {
-    initialize?: unknown;
-    plan?: unknown;
-    work?: unknown;
-    eval?: unknown;
-  };
+  derivation: Record<string, unknown>; // keyed by signal.type; payload-opaque
+};
+
+type TransitionRule = {
+  from: State;
+  signal: string;                      // matches Signal.type
+  to: State;                           // the next state
 };
 ```
 
-`derivation` holds the payload from each signal, keyed by signal type. No special field for "brief" — the `initialize` payload is stored the same way every other phase output is.
+Every field is either primitive or `unknown`. The engine does not know Playbook's states, its signal types, or anything about `payload` content.
 
-### Transition (the step model)
+### The step (how one signal is processed)
 
-Every signal is processed as two generic operations:
+Every `SubmitSignal` call is two generic operations:
 
-1. **Update.** Store the signal's payload into `derivation[signal.type]`. Mechanical — the engine routes by signal type only and never reads payload content.
-2. **Transition.** Determine the next state.
+1. **Update.** Store the signal's payload into `derivation[signal.type]`. Mechanical; the engine routes by `signal.type` only and never reads payload content.
+2. **Transition.** Determine the next state. In the basic version, this is a lookup in the caller-provided rules table.
 
 In the basic version both are combined in one pure function:
 
 ```ts
-function transition(unit: Unit, signal: Signal): Unit;
+function transition(
+  unit: Unit,
+  signal: Signal,
+  rules: TransitionRule[],
+): Unit;
 ```
 
-Maps `(state, signal)` to the next state and stores the signal's payload into `derivation[signal.type]`. Throws on invalid combinations (wrong signal for current state, signal applied to a `Completed` unit, etc.).
+Maps `(unit.state, signal.type)` to the next state via `rules`, and stores `signal.payload` into `derivation[signal.type]`. Throws if no rule matches, or if the unit is in a terminal state (a state with no outgoing rules).
 
-Future features extend step 2 by plugging a caller-provided **outcome policy** into specific rule rows. The policy may inspect the unit (including prior `derivation` and `metadata`) and the incoming signal to pick the next state. Ralph loop, blocks, composite joins, approval gates, timeouts — all compose from this single extension point. The engine never interprets payload or metadata content; the policy does.
-
-**Ralph loop is one example.** At the `Evaluating + eval` rule, a Ralph-loop policy reads `derivation.work`, the eval's gate payload, and `metadata.iteration` to return `Completed` (pass), `Working` (retry), or a capped terminal. From the engine's perspective, that's no different from any other transition — it's just what the rule row resolves to.
-
-The valid transitions in the basic version:
-
-| From | Signal | To |
-|---|---|---|
-| (unit doesn't exist) | `initialize` | `Initializing` |
-| `Initializing` | `plan` | `Planning` |
-| `Planning` | `work` | `Working` |
-| `Working` | `eval` | `Evaluating` |
-| `Evaluating` | (auto) | `Completed` |
-
-The `Evaluating → Completed` step is automatic in the basic version: any `eval` signal completes the unit. The richer outcome policy (pass/retry/capped/blocked) is a later feature.
+Later features extend step 2 with a caller-provided **outcome policy** port — at specific rule rows, the engine asks the policy for the next state instead of reading it from the rule. That extension point lets the caller compose retry loops, blocks, joins, approvals, timeouts — all without the engine growing new vocabulary.
 
 ## Application layer
 
@@ -153,12 +115,12 @@ SubmitSignal(unitId: string, signal: Signal): Promise<Unit>;
 
 Flow:
 
-1. Load unit via `Checkpointer.load(unitId)`. If `null` and signal is `initialize`, start fresh.
-2. Apply `transition(unit, signal)` → new unit.
+1. Load unit via `Checkpointer.load(unitId)`. If `null` and the caller's rules permit starting from a fresh unit with this signal, start fresh.
+2. Apply `transition(unit, signal, rules)` → new unit.
 3. Save via `Checkpointer.save(newUnit)`.
 4. Return the new unit.
 
-Validation errors (wrong state, missing unit for non-initialize signal) reject the call without saving.
+Validation errors (no matching rule, unit in terminal state) reject the call without saving.
 
 ### Outbound port: Checkpointer
 
@@ -174,7 +136,7 @@ Two implementations ship together (per `D18`: ≥2 implementations to justify th
 - `MemoryCheckpointer` — Map-backed; for tests.
 - `SqliteCheckpointer` — `better-sqlite3`-backed; default for real use.
 
-Both JSON-serialize `payload` on save. Non-serializable payloads (functions, Symbols, cyclic refs) fail at save time — an application-layer concern, not the engine's.
+Both JSON-serialize `derivation` on save. Non-serializable payloads (functions, Symbols, cyclic refs) fail at save time — a caller concern, not the engine's.
 
 ## Hexagonal layout
 
@@ -182,42 +144,45 @@ Both JSON-serialize `payload` on save. Non-serializable payloads (functions, Sym
    Caller
      │
      ▼
-   ┌──────────────────────────┐
-   │  Application             │
-   │    SubmitSignal          │
-   └────────────┬─────────────┘
-                │
-                ▼
-   ┌──────────────────────────┐
-   │  Domain (pure)           │
-   │    transition(unit, sig) │
-   └──────────────────────────┘
-                ▲
-                │ uses
-   ┌────────────┴─────────────┐
-   │  Outbound port           │
-   │    Checkpointer          │
-   └────────────┬─────────────┘
-                │ implemented by
-                ▼
-   ┌──────────────────────────┐
-   │  Adapters                │
-   │    MemoryCheckpointer    │
-   │    SqliteCheckpointer    │
-   └──────────────────────────┘
+   ┌──────────────────────────────────────┐
+   │  Application                         │
+   │    SubmitSignal                      │
+   └────────────────┬─────────────────────┘
+                    │
+                    ▼
+   ┌──────────────────────────────────────┐
+   │  Domain (pure)                       │
+   │    transition(unit, signal, rules)   │
+   └──────────────────────────────────────┘
+                    ▲
+                    │ uses
+   ┌────────────────┴─────────────────────┐
+   │  Outbound port                       │
+   │    Checkpointer                      │
+   └────────────────┬─────────────────────┘
+                    │ implemented by
+                    ▼
+   ┌──────────────────────────────────────┐
+   │  Adapters                            │
+   │    MemoryCheckpointer                │
+   │    SqliteCheckpointer                │
+   └──────────────────────────────────────┘
 ```
 
-"Caller" is whoever invokes `SubmitSignal`. In tests: the test itself. In integration: a future MCP adapter, CLI, or anything else. The engine doesn't know.
+"Caller" is whoever invokes `SubmitSignal`. In tests: the test itself. In integration: a future transport adapter. The engine doesn't know and doesn't care.
 
 ## Composition root
 
 ```ts
-function createEngine(deps: { checkpointer: Checkpointer }): Engine;
+function createEngine(config: {
+  rules: TransitionRule[];
+  checkpointer: Checkpointer;
+}): Engine;
 ```
 
-Returns an `Engine` exposing `SubmitSignal`. One factory, one wiring point.
+Returns an `Engine` exposing `SubmitSignal`. One factory. The caller passes its rules (the state and signal vocabulary it wants to support) alongside the persistence adapter.
 
-## Sequence: the happy path
+## Sequence: a generic signal round trip
 
 ```mermaid
 sequenceDiagram
@@ -227,51 +192,69 @@ sequenceDiagram
     participant Dom as transition
     participant CP as Checkpointer
 
-    C->>UC: SubmitSignal(id, initialize)
+    C->>UC: SubmitSignal(id, signal)
     UC->>CP: load(id)
-    CP-->>UC: null
-    UC->>Dom: transition(fresh, initialize)
-    Dom-->>UC: {state: Initializing}
-    UC->>CP: save(unit)
-    UC-->>C: unit
-
-    C->>UC: SubmitSignal(id, plan)
-    UC->>CP: load(id)
-    UC->>Dom: transition(unit, plan)
-    Dom-->>UC: {state: Planning}
-    UC->>CP: save
-    UC-->>C: unit
-
-    C->>UC: SubmitSignal(id, work)
-    UC->>Dom: transition → {state: Working}
-    UC->>CP: save
-
-    C->>UC: SubmitSignal(id, eval)
-    UC->>Dom: transition → {state: Completed}
-    UC->>CP: save
-    UC-->>C: terminal
+    CP-->>UC: unit (or null)
+    UC->>Dom: transition(unit, signal, rules)
+    Dom-->>UC: new unit (state + derivation updated)
+    UC->>CP: save(new unit)
+    UC-->>C: new unit
 ```
 
-That's the entire basic-version story. One linear path.
+One linear path, regardless of what states or signals the caller defined.
 
 ## Invariants
 
 - **I-1.** Domain imports nothing outside `src/domain/`.
-- **I-2.** `transition` is pure: same `(unit, signal)` → same result.
+- **I-2.** `transition` is pure: same `(unit, signal, rules)` → same result.
 - **I-3.** A signal is either applied (saved) or rejected (no state change).
 - **I-4.** Every outbound port has ≥2 implementations.
-- **I-5.** No `any` in domain; Zod gates every signal's **shape** (not its payload's content).
-- **I-6.** Engine never reads `payload` content. Payloads pass through unchanged.
+- **I-5.** No `any` in domain; Zod gates every signal's **shape** (not payload content).
+- **I-6.** Engine never reads `payload` or `derivation` content. They pass through unchanged.
+- **I-7.** Engine never reads state labels for semantics; it only compares them as strings.
 
 ## Tests we expect
 
 Module is testable in isolation:
 
-- **Domain tests** — `transition` against a table of `(state, signal) → state` cases. No I/O, no mocks.
-- **Use-case tests** — `SubmitSignal` with `MemoryCheckpointer`. Assert unit state after each signal.
+- **Domain tests** — `transition` against a table of `(state, signal, rules) → state` cases. Configure the rules per test. No I/O, no mocks.
+- **Use-case tests** — `SubmitSignal` with `MemoryCheckpointer` and a small rule set. Assert unit state after each signal.
 - **Adapter contract tests** — same suite run against `MemoryCheckpointer` and `SqliteCheckpointer`. Both must pass.
-- **Payload-opacity tests** — round-trip arbitrary payload shapes (string, object, array, nested) through `initialize/plan/work/eval`; assert the engine hands back exactly what it received.
+- **Payload-opacity tests** — round-trip arbitrary payload shapes through any signal type; assert the engine hands back exactly what it received.
+- **State-opacity tests** — configure the engine with arbitrary state labels (random strings); assert behavior is identical to the named-state configuration.
+
+## Appendix: Playbook's configuration (example)
+
+Playbook is one caller. Its configuration of the engine, for reference — not part of the engine itself.
+
+**States (5, linear, terminal at last):**
+
+```
+"Initializing" → "Planning" → "Working" → "Evaluating" → "Completed"
+```
+
+**Signal types (4):**
+
+```
+"initialize", "plan", "work", "eval"
+```
+
+**Rules (4, basic linear):**
+
+```ts
+[
+  { from: "(fresh)",       signal: "initialize", to: "Initializing" },
+  { from: "Initializing",  signal: "plan",       to: "Planning" },
+  { from: "Planning",      signal: "work",       to: "Working" },
+  { from: "Working",       signal: "eval",       to: "Evaluating" },
+  { from: "Evaluating",    signal: "eval",       to: "Completed" },
+]
+```
+
+(The last row's auto-completion on any `eval` is Playbook's basic-version choice; richer outcome policies come with the `OutcomePolicy` feature doc.)
+
+Playbook also defines the `Brief`, `Plan`, `Work`, `Eval` shapes that its agents produce as `payload`, but those live in Playbook's domain — the engine never sees them as anything but `unknown`.
 
 ## How this changes
 
-When a feature in the "Out of scope" list begins implementation, write a new architecture doc that adds it on top of this one. The new doc states what it changes (which states / signals / ports / invariants), proposes the deltas, and lands as a PR alongside the code. This document stays as the immutable bedrock — features extend, they don't rewrite.
+When a future feature in the "Out" list begins implementation, write a new architecture doc that adds it on top of this one. The new doc states what it changes (which types / ports / invariants), proposes the deltas, and lands as a PR alongside the code. This document stays as the immutable bedrock — features extend via **generic primitives** (policy port, entry actions as data, metadata bucket, tree composition at app level). No feature introduces domain-specific concepts into the engine. The engine stays payload-blind, state-blind, and domain-blind.
