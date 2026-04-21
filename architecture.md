@@ -110,9 +110,14 @@ type Unit = {
 
 `derivation` holds the payload from each signal, keyed by signal type. No special field for "brief" — the `initialize` payload is stored the same way every other phase output is.
 
-### Transition
+### Transition (the step model)
 
-One pure function.
+Every signal is processed as two generic operations:
+
+1. **Update.** Store the signal's payload into `derivation[signal.type]`. Mechanical — the engine routes by signal type only and never reads payload content.
+2. **Transition.** Determine the next state.
+
+In the basic version both are combined in one pure function:
 
 ```ts
 function transition(unit: Unit, signal: Signal): Unit;
@@ -120,7 +125,11 @@ function transition(unit: Unit, signal: Signal): Unit;
 
 Maps `(state, signal)` to the next state and stores the signal's payload into `derivation[signal.type]`. Throws on invalid combinations (wrong signal for current state, signal applied to a `Completed` unit, etc.).
 
-The valid transitions:
+Future features extend step 2 by plugging a caller-provided **outcome policy** into specific rule rows. The policy may inspect the unit (including prior `derivation` and `metadata`) and the incoming signal to pick the next state. Ralph loop, blocks, composite joins, approval gates, timeouts — all compose from this single extension point. The engine never interprets payload or metadata content; the policy does.
+
+**Ralph loop is one example.** At the `Evaluating + eval` rule, a Ralph-loop policy reads `derivation.work`, the eval's gate payload, and `metadata.iteration` to return `Completed` (pass), `Working` (retry), or a capped terminal. From the engine's perspective, that's no different from any other transition — it's just what the rule row resolves to.
+
+The valid transitions in the basic version:
 
 | From | Signal | To |
 |---|---|---|
