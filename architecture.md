@@ -16,6 +16,14 @@ A **transition** moves a unit from one state to another. Rules are declarative d
 
 The engine treats state, signal types, and payloads as opaque. It routes, stores, and persists — the caller interprets.
 
+## Engine vs orchestrator
+
+The engine advances **one unit at a time**. Anything involving multiple units — tree, DAG, pipeline, parallel branches, dependencies — is **orchestration** and lives outside the engine. An orchestrator is a caller that decides which unit gets which signal when.
+
+Playbook is one orchestrator (it arranges units into a tree and walks them depth-first). Other callers — tests, pipeline tools, DAG runners, debuggers — arrange units into entirely different shapes using the same engine. The engine stays the same across all of them.
+
+This is the deepest split in the architecture. Every "feature" in the Out list below is either (a) an extension to the engine's primitives (rules, policy, actions, metadata) or (b) work that lives entirely in an orchestrator. Nothing expands the engine's job beyond "advance one unit's state when a signal arrives."
+
 ## Scope
 
 **In**
@@ -33,7 +41,7 @@ The engine treats state, signal types, and payloads as opaque. It routes, stores
 1. **Policy hook** — caller-provided `OutcomePolicy` port for dynamic transitions (enables retry loops, blocks, aggregate joins, approval gates, timeouts — all as caller compositions).
 2. **Entry actions** — rule-declared actions run after transition; handlers caller-provided.
 3. **Metadata bucket** — caller-owned `Record<string, unknown>` on the unit, for counters / deadlines / approvals / anything the engine shouldn't interpret.
-4. **Tree composition** — pipe (sequential units) and expand (composite with children). App-level orchestration; the engine stays single-unit.
+4. **Playbook's tree orchestrator** — pipe (sequential units), expand (composite with children), DFS traversal. A separate architecture doc at the orchestrator level; does not modify the engine.
 5. **Journal and replay** — crash-recovery log alongside the checkpoint.
 6. **Parallel step processing** — concurrent units under structured concurrency.
 7. **Transport layers** — MCP, CLI, or any adapter that translates inbound calls into `SubmitSignal` invocations.
