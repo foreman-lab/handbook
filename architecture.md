@@ -83,6 +83,7 @@ type Event = {
 
 type State = {
   id: StateId;
+  label?: string;                   // human-readable name for UIs, logs, docs
   terminal?: boolean;
   meta?: Record<string, unknown>;   // caller-owned; engine never reads
   // future (feature-specific): entry?, exit?, timeout?
@@ -92,6 +93,7 @@ type Transition = {
   from: StateId;                    // points to State.id in the same definition
   event: string;
   to: StateId;
+  label?: string;                   // human-readable name for UIs, logs, docs
   meta?: Record<string, unknown>;   // caller-owned; engine never reads
 };
 
@@ -359,7 +361,7 @@ The engine is deliberately minimal. Every future capability extends through one 
 
 Pull-style integrations (GraphQL, REST, CLI listing, documentation generators, diagram exporters) are **adapters around `Store`**, not engine changes. The store exposes `loadDefinition(id, version)` and `loadMachine(id)`; those are enough to serve any read API. Push-style integrations (dashboards, live timelines) use the future `Subscriber` port for transition events.
 
-For runtime-growing systems where users author many definitions, `State.meta` and `Transition.meta` carry the display-layer data the engine refuses to invent — names, descriptions, icons, documentation links, whatever the UI needs. The engine persists them as opaque bags; the UI reads them through its adapter.
+For runtime-growing systems where users author many definitions, `State.label` and `Transition.label` hold the human-readable names most UIs need. Anything richer — descriptions, icons, colors, documentation links, tags — goes into `State.meta` and `Transition.meta` as caller-defined shapes. The engine persists all of them as opaque values; the UI reads them through its adapter.
 
 What this rules out (deliberately):
 
@@ -374,7 +376,7 @@ What this rules out (deliberately):
 - **I-3.** An event is either applied (machine saved) or rejected (no state change).
 - **I-4.** Every outbound port has ≥2 implementations.
 - **I-5.** No `any` in domain; Zod gates every event's and definition's shape.
-- **I-6.** Engine never reads `payload`, `context`, `Machine.meta`, `State.meta`, or `Transition.meta` content. They pass through unchanged.
+- **I-6.** Engine reads only the structural fields it needs to route events and validate transitions (`id`, `state`, `from`, `to`, `event`, `terminal`, `version`, `revision`). All other fields — `payload`, `context`, `Machine.meta`, `State.label`, `State.meta`, `Transition.label`, `Transition.meta` — pass through unchanged.
 - **I-7.** Engine never reads `StateId` values for semantics; it only compares them as strings. Resolution to `State` objects is always scoped by `(definitionId, definitionVersion)`.
 - **I-8.** Every machine carries `(definitionId, definitionVersion)`. Dispatch uses that exact version; no silent upgrades.
 - **I-9.** `saveDefinition` and `registerDefinition` are idempotent on `(id, version)`.
@@ -413,17 +415,17 @@ await engine.registerDefinition({
   version: "1",
   initialState: "Initializing",
   states: [
-    { id: "Initializing" },
-    { id: "Planning" },
-    { id: "Working" },
-    { id: "Evaluating" },
-    { id: "Completed", terminal: true },
+    { id: "Initializing", label: "Setting up" },
+    { id: "Planning",     label: "Planning" },
+    { id: "Working",      label: "Executing" },
+    { id: "Evaluating",   label: "Evaluating" },
+    { id: "Completed",    label: "Done", terminal: true },
   ],
   transitions: [
-    { from: "Initializing", event: "plan", to: "Planning" },
-    { from: "Planning",     event: "work", to: "Working" },
-    { from: "Working",      event: "eval", to: "Evaluating" },
-    { from: "Evaluating",   event: "eval", to: "Completed" },
+    { from: "Initializing", event: "plan", to: "Planning",   label: "Propose plan" },
+    { from: "Planning",     event: "work", to: "Working",    label: "Start work" },
+    { from: "Working",      event: "eval", to: "Evaluating", label: "Submit evaluation" },
+    { from: "Evaluating",   event: "eval", to: "Completed",  label: "Finalize" },
   ],
 });
 
