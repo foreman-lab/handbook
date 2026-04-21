@@ -1,6 +1,6 @@
 # State Machine — Basic
 
-A generic state machine module. Opaque to domain. Configured at construction with a state set, a signal set, transition rules, and optional ports. Playbook is one caller; the engine knows nothing about Playbook's 4-phase lifecycle, crafts, briefs, or any other domain term.
+A generic state machine module. Opaque to domain. Configured at construction with a state set, an event set, transitions, and optional ports. Playbook is one caller; the engine knows nothing about Playbook's 4-phase lifecycle, crafts, briefs, or any other domain term.
 
 Tied to [`foundations.md`](foundations.md).
 
@@ -8,43 +8,43 @@ Tied to [`foundations.md`](foundations.md).
 
 A **state** is a label for a position. Any string. Caller-defined.
 
-A **signal** is an input to the machine: a type and an opaque payload.
+An **event** is an input to the machine: a type and an opaque payload.
 
-A **unit** is a stateful entity that traverses states by receiving signals.
+A **machine** is a stateful entity that traverses states by receiving events. Has an id, a current state, context (writable data), and metadata (caller-owned bag).
 
-A **transition** moves a unit from one state to another. Rules are declarative data; an optional policy port handles dynamic branches.
+A **transition** moves a machine from one state to another. Rules are declarative data; an optional router port handles dynamic branches.
 
-The engine treats state, signal types, and payloads as opaque. It routes, stores, and persists — the caller interprets.
+The engine treats state labels, event types, and payloads as opaque. It routes, stores, and persists — the caller interprets.
 
 ## Engine vs orchestrator
 
-The engine advances **one unit at a time**. Anything involving multiple units — tree, DAG, pipeline, parallel branches, dependencies — is **orchestration** and lives outside the engine. An orchestrator is a caller that decides which unit gets which signal when.
+The engine advances **one machine at a time**. Anything involving multiple machines — tree, DAG, pipeline, parallel branches, dependencies — is **orchestration** and lives outside the engine. An orchestrator is a caller that decides which machine gets which event when.
 
-Playbook is one orchestrator (it arranges units into a tree and walks them depth-first). Other callers — tests, pipeline tools, DAG runners, debuggers — arrange units into entirely different shapes using the same engine. The engine stays the same across all of them.
+Playbook is one orchestrator (it arranges machines into a tree and walks them depth-first). Other callers — tests, pipeline tools, DAG runners, debuggers — arrange machines into entirely different shapes using the same engine. The engine stays the same across all of them.
 
-This is the deepest split in the architecture. Every "feature" in the Out list below is either (a) an extension to the engine's primitives (rules, policy, actions, metadata) or (b) work that lives entirely in an orchestrator. Nothing expands the engine's job beyond "advance one unit's state when a signal arrives."
+This is the deepest split in the architecture. Every "feature" in the Out list below is either (a) an extension to the engine's primitives (transitions, router, actions, context) or (b) work that lives entirely in an orchestrator. Nothing expands the engine's job beyond "advance one machine's state when an event arrives."
 
 ## Scope
 
 **In**
 
-- Generic single-unit finite state machine.
+- Generic single-machine finite state machine.
 - Caller-defined states (any string set).
-- Caller-defined signal types (any string set).
-- Caller-defined transition rules as data.
-- Opaque payloads on signals; engine never reads content.
-- One outbound port: `Checkpointer` (save / load unit).
-- One use case: `SubmitSignal`.
+- Caller-defined event types (any string set).
+- Caller-defined transitions as data.
+- Opaque payloads on events; engine never reads content.
+- One outbound port: `Store` (save / load machine).
+- One use case: `dispatch`.
 
 **Out (added in later docs)**
 
-1. **Policy hook** — caller-provided `OutcomePolicy` port for dynamic transitions (enables retry loops, blocks, aggregate joins, approval gates, timeouts — all as caller compositions).
-2. **Entry actions** — rule-declared actions run after transition; handlers caller-provided.
-3. **Metadata bucket** — caller-owned `Record<string, unknown>` on the unit, for counters / deadlines / approvals / anything the engine shouldn't interpret.
-4. **Playbook's tree orchestrator** — pipe (sequential units), expand (composite with children), DFS traversal. A separate architecture doc at the orchestrator level; does not modify the engine.
-5. **Journal and replay** — crash-recovery log alongside the checkpoint.
-6. **Parallel step processing** — concurrent units under structured concurrency.
-7. **Transport layers** — MCP, CLI, or any adapter that translates inbound calls into `SubmitSignal` invocations.
+1. **Router** — caller-provided port for dynamic transitions (enables retry loops, blocks, aggregate joins, approval gates, timeouts — all as caller compositions).
+2. **Entry actions** — transition-declared actions run after the state change; handlers caller-provided.
+3. **Guards** — boolean predicates on transitions (does this rule apply?), caller-provided.
+4. **Playbook's tree orchestrator** — pipe (sequential machines), expand (composite with children), DFS traversal. A separate architecture doc at the orchestrator level; does not modify the engine.
+5. **Journal and replay** — crash-recovery log alongside the store.
+6. **Parallel step processing** — concurrent machines under structured concurrency.
+7. **Transport layers** — MCP, CLI, or any adapter that translates inbound calls into `dispatch` invocations.
 
 Each gets its own architecture doc when its turn comes.
 
@@ -60,91 +60,94 @@ We split the state machine into two ideas, the same way LangGraph does — but s
 
 The basic engine simplifies both:
 
-- **State** is one channel: `state` (the position). `derivation` carries content alongside but does not drive transitions.
-- **Transition** is one pure function: `transition(unit, signal) → unit`. Rules are a flat table; no graph definition, no node functions, no conditional edges.
+- **State** is one channel: `state` (the position). `context` carries content alongside but does not drive transitions.
+- **Transition** is one pure function: `transition(machine, event) → machine`. Rules are a flat table; no graph definition, no node functions, no conditional edges.
 
 Pay the LangGraph tax (subgraph quirks, ephemeral checkpoint namespaces, type leakage — see handbook issue #4) only when the engine actually needs it. The basic version doesn't.
 
 ### Generic types
 
 ```ts
-type State = string;                   // caller-defined label
+type State = string;                 // caller-defined label
 
-type Signal = {
-  type: string;                        // caller-defined signal type
-  payload: unknown;                    // opaque to engine
+type Event = {
+  type: string;                      // caller-defined event type
+  payload: unknown;                  // opaque to engine
 };
 
-type Unit = {
+type Machine = {
   id: string;
   state: State;
-  derivation: Record<string, unknown>; // keyed by signal.type; payload-opaque
+  context: Record<string, unknown>;  // keyed by event.type; payload-opaque
+  metadata: Record<string, unknown>; // caller-owned bag
 };
 
-type TransitionRule = {
+type Transition = {
   from: State;
-  signal: string;                      // matches Signal.type
-  to: State;                           // the next state
+  event: string;                     // matches Event.type
+  to: State;                         // the next state
 };
 ```
 
-Every field is either primitive or `unknown`. The engine does not know Playbook's states, its signal types, or anything about `payload` content.
+Every field is either primitive or `unknown`. The engine does not know Playbook's states, its event types, or anything about `payload` content.
 
-### The step (how one signal is processed)
+### The step (how one event is processed)
 
-Every `SubmitSignal` call is two generic operations:
+Every `dispatch` call is two generic operations:
 
-1. **Update.** Store the signal's payload into `derivation[signal.type]`. Mechanical; the engine routes by `signal.type` only and never reads payload content.
-2. **Transition.** Determine the next state. In the basic version, this is a lookup in the caller-provided rules table.
+1. **Update.** Store the event's payload into `context[event.type]`. Mechanical; the engine routes by `event.type` only and never reads payload content.
+2. **Transition.** Determine the next state. In the basic version, this is a lookup in the caller-provided transition table.
 
 In the basic version both are combined in one pure function:
 
 ```ts
 function transition(
-  unit: Unit,
-  signal: Signal,
-  rules: TransitionRule[],
-): Unit;
+  machine: Machine,
+  event: Event,
+  transitions: Transition[],
+): Machine;
 ```
 
-Maps `(unit.state, signal.type)` to the next state via `rules`, and stores `signal.payload` into `derivation[signal.type]`. Throws if no rule matches, or if the unit is in a terminal state (a state with no outgoing rules).
+Maps `(machine.state, event.type)` to the next state via `transitions`, and stores `event.payload` into `context[event.type]`. Throws if no row matches, or if the machine is in a terminal state (a state with no outgoing transitions).
 
-Later features extend step 2 with a caller-provided **outcome policy** port — at specific rule rows, the engine asks the policy for the next state instead of reading it from the rule. That extension point lets the caller compose retry loops, blocks, joins, approvals, timeouts — all without the engine growing new vocabulary.
+Later features extend step 2 with a caller-provided **`Router` port** — at specific rows, the engine asks the router for the next state instead of reading it from the row. That extension point lets the caller compose retry loops, blocks, joins, approvals, timeouts — all without the engine growing new vocabulary.
 
 ## Application layer
 
-### Use case: SubmitSignal
+### Use case: `dispatch`
 
-The engine's only public function in the basic version.
+The engine's only public method in the basic version.
 
 ```ts
-SubmitSignal(unitId: string, signal: Signal): Promise<Unit>;
+interface Engine {
+  dispatch(machineId: string, event: Event): Promise<Machine>;
+}
 ```
 
 Flow:
 
-1. Load unit via `Checkpointer.load(unitId)`. If `null` and the caller's rules permit starting from a fresh unit with this signal, start fresh.
-2. Apply `transition(unit, signal, rules)` → new unit.
-3. Save via `Checkpointer.save(newUnit)`.
-4. Return the new unit.
+1. Load machine via `Store.load(machineId)`. If `null` and the caller's transitions permit starting fresh with this event, create a new machine.
+2. Apply `transition(machine, event, transitions)` → new machine.
+3. Save via `Store.save(newMachine)`.
+4. Return the new machine.
 
-Validation errors (no matching rule, unit in terminal state) reject the call without saving.
+Validation errors (no matching transition, machine in terminal state) reject the call without saving.
 
-### Outbound port: Checkpointer
+### Outbound port: `Store`
 
 ```ts
-interface Checkpointer {
-  save(unit: Unit): Promise<void>;
-  load(unitId: string): Promise<Unit | null>;
+interface Store {
+  save(machine: Machine): Promise<void>;
+  load(machineId: string): Promise<Machine | null>;
 }
 ```
 
 Two implementations ship together (per `D18`: ≥2 implementations to justify the port):
 
-- `MemoryCheckpointer` — Map-backed; for tests.
-- `SqliteCheckpointer` — `better-sqlite3`-backed; default for real use.
+- `MemoryStore` — Map-backed; for tests.
+- `SqliteStore` — `better-sqlite3`-backed; default for real use.
 
-Both JSON-serialize `derivation` on save. Non-serializable payloads (functions, Symbols, cyclic refs) fail at save time — a caller concern, not the engine's.
+Both JSON-serialize `context` and `metadata` on save. Non-serializable payloads (functions, Symbols, cyclic refs) fail at save time — a caller concern, not the engine's.
 
 ## Hexagonal layout
 
@@ -152,83 +155,83 @@ Both JSON-serialize `derivation` on save. Non-serializable payloads (functions, 
    Caller
      │
      ▼
-   ┌──────────────────────────────────────┐
-   │  Application                         │
-   │    SubmitSignal                      │
-   └────────────────┬─────────────────────┘
+   ┌────────────────────────────────────────┐
+   │  Application                           │
+   │    engine.dispatch                     │
+   └────────────────┬───────────────────────┘
                     │
                     ▼
-   ┌──────────────────────────────────────┐
-   │  Domain (pure)                       │
-   │    transition(unit, signal, rules)   │
-   └──────────────────────────────────────┘
+   ┌────────────────────────────────────────┐
+   │  Domain (pure)                         │
+   │    transition(machine, event, rules)   │
+   └────────────────────────────────────────┘
                     ▲
                     │ uses
-   ┌────────────────┴─────────────────────┐
-   │  Outbound port                       │
-   │    Checkpointer                      │
-   └────────────────┬─────────────────────┘
+   ┌────────────────┴───────────────────────┐
+   │  Outbound port                         │
+   │    Store                               │
+   └────────────────┬───────────────────────┘
                     │ implemented by
                     ▼
-   ┌──────────────────────────────────────┐
-   │  Adapters                            │
-   │    MemoryCheckpointer                │
-   │    SqliteCheckpointer                │
-   └──────────────────────────────────────┘
+   ┌────────────────────────────────────────┐
+   │  Adapters                              │
+   │    MemoryStore                         │
+   │    SqliteStore                         │
+   └────────────────────────────────────────┘
 ```
 
-"Caller" is whoever invokes `SubmitSignal`. In tests: the test itself. In integration: a future transport adapter. The engine doesn't know and doesn't care.
+"Caller" is whoever invokes `dispatch`. In tests: the test itself. In integration: a future transport adapter. The engine doesn't know and doesn't care.
 
 ## Composition root
 
 ```ts
 function createEngine(config: {
-  rules: TransitionRule[];
-  checkpointer: Checkpointer;
+  transitions: Transition[];
+  store: Store;
 }): Engine;
 ```
 
-Returns an `Engine` exposing `SubmitSignal`. One factory. The caller passes its rules (the state and signal vocabulary it wants to support) alongside the persistence adapter.
+Returns an `Engine` exposing `dispatch`. One factory. The caller passes its transitions (the state and event vocabulary it wants to support) alongside the persistence adapter.
 
-## Sequence: a generic signal round trip
+## Sequence: a generic event round trip
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Caller
-    participant UC as SubmitSignal
+    participant E as engine.dispatch
     participant Dom as transition
-    participant CP as Checkpointer
+    participant S as Store
 
-    C->>UC: SubmitSignal(id, signal)
-    UC->>CP: load(id)
-    CP-->>UC: unit (or null)
-    UC->>Dom: transition(unit, signal, rules)
-    Dom-->>UC: new unit (state + derivation updated)
-    UC->>CP: save(new unit)
-    UC-->>C: new unit
+    C->>E: dispatch(id, event)
+    E->>S: load(id)
+    S-->>E: machine (or null)
+    E->>Dom: transition(machine, event, rules)
+    Dom-->>E: new machine (state + context updated)
+    E->>S: save(new machine)
+    E-->>C: new machine
 ```
 
-One linear path, regardless of what states or signals the caller defined.
+One linear path, regardless of what states or event types the caller defined.
 
 ## Invariants
 
 - **I-1.** Domain imports nothing outside `src/domain/`.
-- **I-2.** `transition` is pure: same `(unit, signal, rules)` → same result.
-- **I-3.** A signal is either applied (saved) or rejected (no state change).
+- **I-2.** `transition` is pure: same `(machine, event, transitions)` → same result.
+- **I-3.** An event is either applied (saved) or rejected (no state change).
 - **I-4.** Every outbound port has ≥2 implementations.
-- **I-5.** No `any` in domain; Zod gates every signal's **shape** (not payload content).
-- **I-6.** Engine never reads `payload` or `derivation` content. They pass through unchanged.
+- **I-5.** No `any` in domain; Zod gates every event's **shape** (not payload content).
+- **I-6.** Engine never reads `payload`, `context`, or `metadata` content. They pass through unchanged.
 - **I-7.** Engine never reads state labels for semantics; it only compares them as strings.
 
 ## Tests we expect
 
 Module is testable in isolation:
 
-- **Domain tests** — `transition` against a table of `(state, signal, rules) → state` cases. Configure the rules per test. No I/O, no mocks.
-- **Use-case tests** — `SubmitSignal` with `MemoryCheckpointer` and a small rule set. Assert unit state after each signal.
-- **Adapter contract tests** — same suite run against `MemoryCheckpointer` and `SqliteCheckpointer`. Both must pass.
-- **Payload-opacity tests** — round-trip arbitrary payload shapes through any signal type; assert the engine hands back exactly what it received.
+- **Domain tests** — `transition` against a table of `(state, event, transitions) → state` cases. Configure transitions per test. No I/O, no mocks.
+- **Use-case tests** — `dispatch` with `MemoryStore` and a small transition set. Assert machine state after each event.
+- **Adapter contract tests** — same suite run against `MemoryStore` and `SqliteStore`. Both must pass.
+- **Payload-opacity tests** — round-trip arbitrary payload shapes through any event type; assert the engine hands back exactly what it received.
 - **State-opacity tests** — configure the engine with arbitrary state labels (random strings); assert behavior is identical to the named-state configuration.
 
 ## Appendix: Playbook's configuration (example)
@@ -241,28 +244,28 @@ Playbook is one caller. Its configuration of the engine, for reference — not p
 "Initializing" → "Planning" → "Working" → "Evaluating" → "Completed"
 ```
 
-**Signal types (4):**
+**Event types (4):**
 
 ```
 "initialize", "plan", "work", "eval"
 ```
 
-**Rules (4, basic linear):**
+**Transitions (5, basic linear):**
 
 ```ts
 [
-  { from: "(fresh)",       signal: "initialize", to: "Initializing" },
-  { from: "Initializing",  signal: "plan",       to: "Planning" },
-  { from: "Planning",      signal: "work",       to: "Working" },
-  { from: "Working",       signal: "eval",       to: "Evaluating" },
-  { from: "Evaluating",    signal: "eval",       to: "Completed" },
+  { from: "(fresh)",       event: "initialize", to: "Initializing" },
+  { from: "Initializing",  event: "plan",       to: "Planning" },
+  { from: "Planning",      event: "work",       to: "Working" },
+  { from: "Working",       event: "eval",       to: "Evaluating" },
+  { from: "Evaluating",    event: "eval",       to: "Completed" },
 ]
 ```
 
-(The last row's auto-completion on any `eval` is Playbook's basic-version choice; richer outcome policies come with the `OutcomePolicy` feature doc.)
+(The last row's auto-completion on any `eval` is Playbook's basic-version choice; richer outcome policies come with the `Router` feature doc.)
 
 Playbook also defines the `Brief`, `Plan`, `Work`, `Eval` shapes that its agents produce as `payload`, but those live in Playbook's domain — the engine never sees them as anything but `unknown`.
 
 ## How this changes
 
-When a future feature in the "Out" list begins implementation, write a new architecture doc that adds it on top of this one. The new doc states what it changes (which types / ports / invariants), proposes the deltas, and lands as a PR alongside the code. This document stays as the immutable bedrock — features extend via **generic primitives** (policy port, entry actions as data, metadata bucket, tree composition at app level). No feature introduces domain-specific concepts into the engine. The engine stays payload-blind, state-blind, and domain-blind.
+When a future feature in the "Out" list begins implementation, write a new architecture doc that adds it on top of this one. The new doc states what it changes (which types / ports / invariants), proposes the deltas, and lands as a PR alongside the code. This document stays as the immutable bedrock — features extend via **generic primitives** (router port, entry actions as data, guards as data, metadata bucket, tree composition at app level). No feature introduces domain-specific concepts into the engine. The engine stays payload-blind, state-blind, and domain-blind.
