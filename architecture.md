@@ -1,6 +1,6 @@
 # State Machine — Basic
 
-A generic state machine module. Opaque to domain. Configured at construction with a state set, an event set, transitions, and optional ports. Playbook is one caller; the engine knows nothing about Playbook's 4-phase lifecycle, crafts, briefs, or any other domain term.
+A generic state machine module. Opaque to domain. Supports a **catalog** of machine definitions that grows at runtime and loads **lazily** from a persistence store. Playbook is one caller; the engine knows nothing about Playbook's 4-phase lifecycle, crafts, briefs, or any other domain term.
 
 Tied to [`foundations.md`](foundations.md).
 
@@ -8,43 +8,49 @@ Tied to [`foundations.md`](foundations.md).
 
 A **state** is a label for a position. Any string. Caller-defined.
 
+A **state node** is a state plus metadata (is it terminal, and — later — entry/exit actions, timeouts). In graph terms, the vertex.
+
 An **event** is an input to the machine: a type and an opaque payload.
 
-A **machine** is a stateful entity that traverses states by receiving events. Has an id, a current state, context (writable data), and metadata (caller-owned bag).
+A **transition** is a rule mapping `(from state, event type) → to state`. In graph terms, the edge.
 
-A **transition** moves a machine from one state to another. Rules are declarative data; an optional router port handles dynamic branches.
+A **machine definition** is the full graph: initial state, state nodes, transitions. Identified by `(id, version)` the caller chooses (semver, hash, anything).
 
-The engine treats state labels, event types, and payloads as opaque. It routes, stores, and persists — the caller interprets.
+A **machine** is a stateful entity traversing a graph. Has an id, current state, context, metadata, and a reference to the definition it runs under (`definitionId`, `definitionVersion`).
+
+The engine maintains a **definition catalog** that grows over time. Definitions are **persisted** in the store, **registered** into the catalog at runtime, and **loaded lazily** when a machine needs one.
 
 ## Engine vs orchestrator
 
-The engine advances **one machine at a time**. Anything involving multiple machines — tree, DAG, pipeline, parallel branches, dependencies — is **orchestration** and lives outside the engine. An orchestrator is a caller that decides which machine gets which event when.
+The engine advances **one machine at a time**. Multi-machine orchestration — tree, DAG, pipeline, parallel — lives in an orchestrator above the engine. Playbook's tree orchestrator is one such caller; tests, debuggers, future tools are others.
 
-Playbook is one orchestrator (it arranges machines into a tree and walks them depth-first). Other callers — tests, pipeline tools, DAG runners, debuggers — arrange machines into entirely different shapes using the same engine. The engine stays the same across all of them.
-
-This is the deepest split in the architecture. Every "feature" in the Out list below is either (a) an extension to the engine's primitives (transitions, router, actions, context) or (b) work that lives entirely in an orchestrator. Nothing expands the engine's job beyond "advance one machine's state when an event arrives."
+The engine's job is fixed: "advance one machine's state when an event arrives, using whichever definition that machine belongs to." Everything else is caller work.
 
 ## Scope
 
 **In**
 
-- Generic single-machine finite state machine.
-- Caller-defined states (any string set).
-- Caller-defined event types (any string set).
-- Caller-defined transitions as data.
+- Generic single-machine finite state machine per dispatch.
+- Caller-defined states (any string set) and event types (any string set).
+- First-class machine definitions: initial state, state nodes, transitions.
+- **Definition catalog** — the engine holds many definitions at once.
+- **Runtime registration** — new definitions can be added while the engine is running.
+- **Lazy loading** — definitions are loaded from the store on demand, not at startup.
+- **Definition versioning** — machines are stamped with `(definitionId, definitionVersion)`; the right graph is looked up per dispatch.
 - Opaque payloads on events; engine never reads content.
-- One outbound port: `Store` (save / load machine).
-- One use case: `dispatch`.
+- One outbound port: `Store` (save / load definitions and machines).
+- Three use cases: `registerDefinition`, `startMachine`, `dispatch`.
 
 **Out (added in later docs)**
 
-1. **Router** — caller-provided port for dynamic transitions (enables retry loops, blocks, aggregate joins, approval gates, timeouts — all as caller compositions).
-2. **Entry actions** — transition-declared actions run after the state change; handlers caller-provided.
-3. **Guards** — boolean predicates on transitions (does this rule apply?), caller-provided.
-4. **Playbook's tree orchestrator** — pipe (sequential machines), expand (composite with children), DFS traversal. A separate architecture doc at the orchestrator level; does not modify the engine.
-5. **Journal and replay** — crash-recovery log alongside the store.
-6. **Parallel step processing** — concurrent machines under structured concurrency.
-7. **Transport layers** — MCP, CLI, or any adapter that translates inbound calls into `dispatch` invocations.
+1. **Router** — caller-provided port for dynamic transitions (retry loops, blocks, joins, approvals, timeouts all compose from it).
+2. **Entry / exit actions** — state- and transition-level side effects.
+3. **Guards** — boolean predicates on transitions.
+4. **Definition migration** — rules for advancing a machine from older definition versions.
+5. **Playbook's tree orchestrator** — pipe, expand, DFS — separate doc at orchestrator level.
+6. **Journal and replay** — crash-recovery log.
+7. **Parallel step processing** — concurrent machines under structured concurrency.
+8. **Transport layers** — MCP, CLI, or any adapter that translates inbound calls into engine invocations.
 
 Each gets its own architecture doc when its turn comes.
 
@@ -54,100 +60,138 @@ Each gets its own architecture doc when its turn comes.
 
 We split the state machine into two ideas, the same way LangGraph does — but simpler.
 
-**State** is data. In LangGraph, state is a typed dictionary of *channels*, each with a reducer function that says how updates merge. Multiple channels coexist; reading state means reading the current value of every channel.
-
-**Transition** is movement. In LangGraph, transition is the *graph* — edges between named *nodes*, where each node is a function that returns a partial state update. The graph decides what runs next.
+**State** is data. **Transition** is movement.
 
 The basic engine simplifies both:
 
-- **State** is one channel: `state` (the position). `context` carries content alongside but does not drive transitions.
-- **Transition** is one pure function: `transition(machine, event) → machine`. Rules are a flat table; no graph definition, no node functions, no conditional edges.
-
-Pay the LangGraph tax (subgraph quirks, ephemeral checkpoint namespaces, type leakage — see handbook issue #4) only when the engine actually needs it. The basic version doesn't.
+- **State** is one channel: `state`. `context` carries content alongside but doesn't drive transitions.
+- **Transition** is one pure function: `transition(machine, event, definition) → machine`. Rules are a flat table.
 
 ### Generic types
 
 ```ts
-type State = string;                 // caller-defined label
+type State = string;
 
 type Event = {
-  type: string;                      // caller-defined event type
-  payload: unknown;                  // opaque to engine
+  type: string;
+  payload: unknown;
 };
 
-type Machine = {
-  id: string;
-  state: State;
-  context: Record<string, unknown>;  // keyed by event.type; payload-opaque
-  metadata: Record<string, unknown>; // caller-owned bag
+type StateNode = {
+  id: State;
+  terminal?: boolean;
+  // future: entry?, exit?, meta?, timeout?
 };
 
 type Transition = {
   from: State;
-  event: string;                     // matches Event.type
-  to: State;                         // the next state
+  event: string;
+  to: State;
+};
+
+type MachineDefinition = {
+  id: string;                          // caller-chosen identifier
+  version: string;                     // caller-chosen version string
+  initialState: State;
+  states: StateNode[];                 // vertices
+  transitions: Transition[];           // edges
+};
+
+type Machine = {
+  id: string;
+  definitionId: string;                // which graph this machine runs under
+  definitionVersion: string;           // at which version
+  state: State;
+  context: Record<string, unknown>;
+  metadata: Record<string, unknown>;
 };
 ```
 
-Every field is either primitive or `unknown`. The engine does not know Playbook's states, its event types, or anything about `payload` content.
-
 ### The step (how one event is processed)
 
-Every `dispatch` call is two generic operations:
+Every `dispatch` is two generic operations:
 
-1. **Update.** Store the event's payload into `context[event.type]`. Mechanical; the engine routes by `event.type` only and never reads payload content.
-2. **Transition.** Determine the next state. In the basic version, this is a lookup in the caller-provided transition table.
+1. **Update.** Store the event's payload into `context[event.type]`. Mechanical.
+2. **Transition.** Look up `(machine.state, event.type)` in the definition's transitions; return the next state.
 
-In the basic version both are combined in one pure function:
+Combined in one pure function:
 
 ```ts
 function transition(
   machine: Machine,
   event: Event,
-  transitions: Transition[],
+  definition: MachineDefinition,
 ): Machine;
 ```
 
-Maps `(machine.state, event.type)` to the next state via `transitions`, and stores `event.payload` into `context[event.type]`. Throws if no row matches, or if the machine is in a terminal state (a state with no outgoing transitions).
+Throws if no row matches, or if `machine.state` is a terminal node.
 
-Later features extend step 2 with a caller-provided **`Router` port** — at specific rows, the engine asks the router for the next state instead of reading it from the row. That extension point lets the caller compose retry loops, blocks, joins, approvals, timeouts — all without the engine growing new vocabulary.
+The engine resolves `definition` on each dispatch by looking up the machine's `definitionId` and `definitionVersion` in the catalog, loading from the store lazily if not already cached.
+
+Later features extend step 2 with a **Router port** — at specific rows, the engine asks a caller-provided router for the next state. Retry loops, blocks, joins, approvals, timeouts all compose from this.
+
+### Definition catalog and lazy loading
+
+The engine holds an in-memory **catalog** keyed by `(definitionId, definitionVersion)`. The catalog is:
+
+- **Lazy**: populated on demand. When a machine is dispatched and its `(definitionId, definitionVersion)` isn't in the catalog, the engine calls `Store.loadDefinition(...)` and caches the result.
+- **Runtime-mutable**: callers register new definitions at any time via `registerDefinition`. Registration saves to the store and adds to the catalog.
+- **Version-precise**: multiple versions of the same `definitionId` can coexist in the catalog. An older machine (stamped with an older version) is dispatched against its own version; a newer machine against its own. No silent upgrades.
+
+Cache policy is adapter-agnostic in the basic version: the engine caches forever unless explicitly evicted. A future revision may add eviction policies (LRU, TTL) without changing the external API.
 
 ## Application layer
 
-### Use case: `dispatch`
+### Use cases
 
-The engine's only public method in the basic version.
+The engine exposes three methods.
 
 ```ts
 interface Engine {
+  // Add or update a definition. Saves to the store and catalogs it.
+  registerDefinition(definition: MachineDefinition): Promise<void>;
+
+  // Create a new machine under a specific definition. Applies the first event.
+  startMachine(args: {
+    machineId: string;
+    definitionId: string;
+    definitionVersion: string;
+    event: Event;
+  }): Promise<Machine>;
+
+  // Advance an existing machine. Resolves its definition lazily.
   dispatch(machineId: string, event: Event): Promise<Machine>;
 }
 ```
 
-Flow:
+**`registerDefinition`** — idempotent on `(id, version)`. Saves to the store, updates the catalog. Multiple calls with the same `(id, version)` are no-ops after the first.
 
-1. Load machine via `Store.load(machineId)`. If `null` and the caller's transitions permit starting fresh with this event, create a new machine.
-2. Apply `transition(machine, event, transitions)` → new machine.
-3. Save via `Store.save(newMachine)`.
-4. Return the new machine.
+**`startMachine`** — fails if `machineId` already exists. Loads the specified definition (cache → store → error), creates a machine stamped with that `(definitionId, definitionVersion)`, applies the first event, saves.
 
-Validation errors (no matching transition, machine in terminal state) reject the call without saving.
+**`dispatch`** — loads the machine, looks up its definition (cache → store → error), applies the event, saves. Fails if the machine doesn't exist.
 
 ### Outbound port: `Store`
 
 ```ts
 interface Store {
-  save(machine: Machine): Promise<void>;
-  load(machineId: string): Promise<Machine | null>;
+  // Definitions (the graphs)
+  saveDefinition(definition: MachineDefinition): Promise<void>;
+  loadDefinition(id: string, version: string): Promise<MachineDefinition | null>;
+
+  // Machines (the instances)
+  saveMachine(machine: Machine): Promise<void>;
+  loadMachine(machineId: string): Promise<Machine | null>;
 }
 ```
 
-Two implementations ship together (per `D18`: ≥2 implementations to justify the port):
+`saveDefinition` is idempotent on `(id, version)`.
+
+Two implementations ship:
 
 - `MemoryStore` — Map-backed; for tests.
 - `SqliteStore` — `better-sqlite3`-backed; default for real use.
 
-Both JSON-serialize `context` and `metadata` on save. Non-serializable payloads (functions, Symbols, cyclic refs) fail at save time — a caller concern, not the engine's.
+Both JSON-serialize definitions and machines on save.
 
 ## Hexagonal layout
 
@@ -155,117 +199,184 @@ Both JSON-serialize `context` and `metadata` on save. Non-serializable payloads 
    Caller
      │
      ▼
-   ┌────────────────────────────────────────┐
-   │  Application                           │
-   │    engine.dispatch                     │
-   └────────────────┬───────────────────────┘
+   ┌────────────────────────────────────────────┐
+   │  Application                               │
+   │    registerDefinition · startMachine       │
+   │    dispatch                                │
+   │                                            │
+   │    (definition catalog, lazy-loaded)       │
+   └────────────────┬───────────────────────────┘
                     │
                     ▼
-   ┌────────────────────────────────────────┐
-   │  Domain (pure)                         │
-   │    transition(machine, event, rules)   │
-   └────────────────────────────────────────┘
+   ┌────────────────────────────────────────────┐
+   │  Domain (pure)                             │
+   │    transition(machine, event, definition)  │
+   └────────────────────────────────────────────┘
                     ▲
                     │ uses
-   ┌────────────────┴───────────────────────┐
-   │  Outbound port                         │
-   │    Store                               │
-   └────────────────┬───────────────────────┘
+   ┌────────────────┴───────────────────────────┐
+   │  Outbound port                             │
+   │    Store                                   │
+   └────────────────┬───────────────────────────┘
                     │ implemented by
                     ▼
-   ┌────────────────────────────────────────┐
-   │  Adapters                              │
-   │    MemoryStore                         │
-   │    SqliteStore                         │
-   └────────────────────────────────────────┘
+   ┌────────────────────────────────────────────┐
+   │  Adapters                                  │
+   │    MemoryStore · SqliteStore               │
+   └────────────────────────────────────────────┘
 ```
 
-"Caller" is whoever invokes `dispatch`. In tests: the test itself. In integration: a future transport adapter. The engine doesn't know and doesn't care.
+The catalog lives in the application layer — not domain (it's mutable state with I/O) and not adapters (it's use-case coordination). It's a cache in front of the `Store` port.
 
 ## Composition root
 
 ```ts
-function createEngine(config: {
-  transitions: Transition[];
+async function createEngine(config: {
   store: Store;
-}): Engine;
+  definitions?: MachineDefinition[];   // optional bootstrap set
+}): Promise<Engine>;
 ```
 
-Returns an `Engine` exposing `dispatch`. One factory. The caller passes its transitions (the state and event vocabulary it wants to support) alongside the persistence adapter.
+Behavior:
 
-## Sequence: a generic event round trip
+1. If `definitions` is provided, call `registerDefinition` for each (saves to store, adds to catalog).
+2. Returns an `Engine` exposing `registerDefinition`, `startMachine`, `dispatch`.
+
+No definition is required at construction — the catalog may start empty and grow entirely at runtime. Lazy loading populates it from the store as needed.
+
+## Sequences
+
+### A. Dispatch with cold cache (lazy load)
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Caller
     participant E as engine.dispatch
-    participant Dom as transition
+    participant Cat as catalog
     participant S as Store
+    participant Dom as transition
 
-    C->>E: dispatch(id, event)
-    E->>S: load(id)
-    S-->>E: machine (or null)
-    E->>Dom: transition(machine, event, rules)
-    Dom-->>E: new machine (state + context updated)
-    E->>S: save(new machine)
+    C->>E: dispatch(machineId, event)
+    E->>S: loadMachine(machineId)
+    S-->>E: machine
+    E->>Cat: lookup(definitionId, version)
+    Cat-->>E: miss
+    E->>S: loadDefinition(id, version)
+    S-->>E: definition
+    E->>Cat: put(definition)
+    E->>Dom: transition(machine, event, definition)
+    Dom-->>E: new machine
+    E->>S: saveMachine(new machine)
     E-->>C: new machine
 ```
 
-One linear path, regardless of what states or event types the caller defined.
+### B. Dispatch with warm cache
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Caller
+    participant E as engine.dispatch
+    participant Cat as catalog
+    participant S as Store
+    participant Dom as transition
+
+    C->>E: dispatch(machineId, event)
+    E->>S: loadMachine(machineId)
+    S-->>E: machine
+    E->>Cat: lookup(definitionId, version)
+    Cat-->>E: definition (cached)
+    E->>Dom: transition(machine, event, definition)
+    Dom-->>E: new machine
+    E->>S: saveMachine(new machine)
+    E-->>C: new machine
+```
+
+### C. Runtime registration
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Caller
+    participant E as engine.registerDefinition
+    participant S as Store
+    participant Cat as catalog
+
+    C->>E: registerDefinition(def)
+    E->>S: saveDefinition(def)
+    Note over S: idempotent on (id, version)
+    E->>Cat: put(def)
+    E-->>C: ok
+```
 
 ## Invariants
 
 - **I-1.** Domain imports nothing outside `src/domain/`.
-- **I-2.** `transition` is pure: same `(machine, event, transitions)` → same result.
-- **I-3.** An event is either applied (saved) or rejected (no state change).
+- **I-2.** `transition` is pure: same `(machine, event, definition)` → same result.
+- **I-3.** An event is either applied (machine saved) or rejected (no state change).
 - **I-4.** Every outbound port has ≥2 implementations.
-- **I-5.** No `any` in domain; Zod gates every event's **shape** (not payload content).
+- **I-5.** No `any` in domain; Zod gates every event's and definition's **shape**.
 - **I-6.** Engine never reads `payload`, `context`, or `metadata` content. They pass through unchanged.
 - **I-7.** Engine never reads state labels for semantics; it only compares them as strings.
+- **I-8.** Every machine carries a `definitionId` and `definitionVersion`. Dispatch uses that exact version; no silent upgrades.
+- **I-9.** `saveDefinition` and `registerDefinition` are idempotent on `(id, version)`.
+- **I-10.** The catalog is a cache: any entry must be reconstructible from the store. Clearing the catalog never loses data.
 
 ## Tests we expect
 
-Module is testable in isolation:
-
-- **Domain tests** — `transition` against a table of `(state, event, transitions) → state` cases. Configure transitions per test. No I/O, no mocks.
-- **Use-case tests** — `dispatch` with `MemoryStore` and a small transition set. Assert machine state after each event.
-- **Adapter contract tests** — same suite run against `MemoryStore` and `SqliteStore`. Both must pass.
-- **Payload-opacity tests** — round-trip arbitrary payload shapes through any event type; assert the engine hands back exactly what it received.
-- **State-opacity tests** — configure the engine with arbitrary state labels (random strings); assert behavior is identical to the named-state configuration.
+- **Domain tests** — `transition` against tables of `(state, event, definition) → state`. Pure, no I/O.
+- **Use-case tests** — `registerDefinition`, `startMachine`, `dispatch` with `MemoryStore`. Assert machine state after each event.
+- **Adapter contract tests** — run against `MemoryStore` and `SqliteStore`. Cover definition save/load, machine save/load, idempotent definition save.
+- **Payload-opacity tests** — round-trip arbitrary payload shapes; engine hands back exactly what it received.
+- **State-opacity tests** — configure with arbitrary random state labels; behavior is unchanged.
+- **Lazy-loading tests** — dispatch a machine whose definition is only in the store, not the catalog; verify the catalog populates from the store exactly once.
+- **Runtime-registration tests** — start with an empty catalog; register a definition at runtime; dispatch successfully against it.
+- **Multi-version tests** — register `(id="x", version="1.0.0")` and `(id="x", version="2.0.0")`; create a machine under each; dispatch; assert each advances under its own definition.
+- **Terminal-state tests** — any event dispatched to a machine in a terminal state is rejected.
+- **Missing-definition tests** — dispatch a machine whose `definitionId`/`version` is neither cached nor in the store; assert clean error.
 
 ## Appendix: Playbook's configuration (example)
 
-Playbook is one caller. Its configuration of the engine, for reference — not part of the engine itself.
-
-**States (5, linear, terminal at last):**
-
-```
-"Initializing" → "Planning" → "Working" → "Evaluating" → "Completed"
-```
-
-**Event types (4):**
-
-```
-"initialize", "plan", "work", "eval"
-```
-
-**Transitions (5, basic linear):**
+Playbook authors let users create playbooks at runtime. Each playbook is a machine definition registered into the engine's catalog. Multiple definitions coexist; new ones are added as users author them.
 
 ```ts
-[
-  { from: "(fresh)",       event: "initialize", to: "Initializing" },
-  { from: "Initializing",  event: "plan",       to: "Planning" },
-  { from: "Planning",      event: "work",       to: "Working" },
-  { from: "Working",       event: "eval",       to: "Evaluating" },
-  { from: "Evaluating",    event: "eval",       to: "Completed" },
-]
+const engine = await createEngine({
+  store: new SqliteStore("./.playbook.sqlite"),
+  // no pre-registered definitions; all arrive at runtime
+});
+
+// user creates a new playbook → orchestrator registers its definition
+await engine.registerDefinition({
+  id: "playbook.user-123.tdd-workflow",
+  version: "1",
+  initialState: "Initializing",
+  states: [
+    { id: "Initializing" },
+    { id: "Planning" },
+    { id: "Working" },
+    { id: "Evaluating" },
+    { id: "Completed", terminal: true },
+  ],
+  transitions: [
+    { from: "Initializing", event: "plan", to: "Planning" },
+    { from: "Planning",     event: "work", to: "Working" },
+    { from: "Working",      event: "eval", to: "Evaluating" },
+    { from: "Evaluating",   event: "eval", to: "Completed" },
+  ],
+});
+
+// orchestrator starts a machine under that playbook's definition
+const machine = await engine.startMachine({
+  machineId: "run-abc",
+  definitionId: "playbook.user-123.tdd-workflow",
+  definitionVersion: "1",
+  event: { type: "initialize", payload: { /* caller-defined */ } },
+});
 ```
 
-(The last row's auto-completion on any `eval` is Playbook's basic-version choice; richer outcome policies come with the `Router` feature doc.)
-
-Playbook also defines the `Brief`, `Plan`, `Work`, `Eval` shapes that its agents produce as `payload`, but those live in Playbook's domain — the engine never sees them as anything but `unknown`.
+Playbook's `Brief`, `Plan`, `Work`, `Eval` payload shapes live in Playbook's domain — the engine sees them only as `unknown`.
 
 ## How this changes
 
-When a future feature in the "Out" list begins implementation, write a new architecture doc that adds it on top of this one. The new doc states what it changes (which types / ports / invariants), proposes the deltas, and lands as a PR alongside the code. This document stays as the immutable bedrock — features extend via **generic primitives** (router port, entry actions as data, guards as data, metadata bucket, tree composition at app level). No feature introduces domain-specific concepts into the engine. The engine stays payload-blind, state-blind, and domain-blind.
+When a future feature in the "Out" list begins implementation, write a new architecture doc that adds it on top of this one. Each new doc states what it changes (types, ports, invariants), proposes the deltas, and lands as a PR alongside the code. This document stays as the bedrock — features extend via generic primitives. No feature introduces domain-specific concepts into the engine. The engine stays payload-blind, state-blind, and domain-blind.
