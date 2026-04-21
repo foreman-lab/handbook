@@ -17,6 +17,8 @@ Two composition modes will exist (both deferred to later docs):
 
 **Recursion is native.** Every child is itself a unit — same 5 states, same 4 signals, same shape. A child may be leaf (its `Working` does the actual work) or composite (its `Working` expands further). Depth is unbounded; the engine treats every level identically.
 
+**Traversal is depth-first.** When expansion ships, sibling N+1 starts only after sibling N's full subtree reaches `Completed`. At any moment one unit is active along a single path from root. Parallel children — where siblings under one parent run concurrently — is an opt-in variant (out-of-scope item 9).
+
 **Signals are uniform.** Every signal has the same shape: `{ type, payload: unknown }`. The engine routes by `type`; payloads pass through unread. This makes design easy: one signal handler, one validation shape, one test pattern across all four states.
 
 The basic version runs **one unit, linearly, no composition.** A root unit where `Working` is leaf. Everything else — pipe, expand, nested composites, parallel children — is future work that extends this shape without changing it.
