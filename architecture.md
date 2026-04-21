@@ -40,7 +40,7 @@ The engine's job is fixed: "advance one machine's state when an event arrives, u
 - **Optimistic concurrency** — each machine has a monotonic `revision`; conflicting writes are rejected.
 - Opaque payloads on events; engine never reads content.
 - One outbound port: `Store` (save / load definitions and machines).
-- Three use cases: `registerDefinition`, `startMachine`, `dispatch`.
+- Three use cases: `register`, `start`, `dispatch`.
 
 **Out (added in later docs)**
 
@@ -154,7 +154,7 @@ Full event history — every attempt, every payload, in order — belongs to the
 
 The engine treats dispatches as **per-machine serial**: at most one `dispatch` per `machineId` is in flight at a time. Enforced via optimistic concurrency on the `Store`:
 
-- `Machine.revision` starts at `0` on `startMachine`.
+- `Machine.revision` starts at `0` on `start`.
 - Each successful `dispatch` increments it by 1 before save.
 - `Store.saveMachine` enforces that the stored revision equals `machine.revision - 1` at save time. If not, it throws a conflict error.
 
@@ -169,7 +169,7 @@ Callers may still need to serialize externally if they want to avoid conflict er
 The engine holds an in-memory **catalog** keyed by `(definitionId, definitionVersion)`. The catalog is:
 
 - **Lazy**: populated on demand. When a machine is dispatched and its `(definitionId, definitionVersion)` isn't in the catalog, the engine calls `Store.loadDefinition(...)` and caches the result.
-- **Runtime-mutable**: callers register new definitions at any time via `registerDefinition`. Registration saves to the store and adds to the catalog.
+- **Runtime-mutable**: callers register new definitions at any time via `register`. Registration saves to the store and adds to the catalog.
 - **Version-precise**: multiple versions of the same `id` can coexist.
 
 Cache policy is adapter-agnostic in the basic version: caches forever unless explicitly evicted. A future revision may add eviction (LRU, TTL) without changing the external API.
@@ -181,26 +181,25 @@ Cache policy is adapter-agnostic in the basic version: caches forever unless exp
 ```ts
 interface Engine {
   // Add or update a definition. Saves to the store and catalogs it.
-  registerDefinition(definition: MachineDefinition): Promise<void>;
+  register(definition: MachineDefinition): Promise<void>;
 
   // Create a new machine under a specific definition at its initialState.
   // Does NOT apply an event. Use dispatch for the first state change.
-  startMachine(args: {
-    machineId: string;
-    definitionId: string;
-    definitionVersion: string;
-    initialContext?: Record<string, unknown>;   // optional bootstrap data
-    initialMeta?: Record<string, unknown>;      // optional bootstrap caller-owned bag
+  start(params: {
+    id: string;                                     // machine id
+    definition: { id: string; version: string };   // which definition, which version
+    context?: Record<string, unknown>;              // initial context (optional)
+    meta?: Record<string, unknown>;                 // initial meta (optional)
   }): Promise<Machine>;
 
   // Advance an existing machine. Resolves its definition lazily from the catalog.
-  dispatch(machineId: string, event: Event): Promise<Machine>;
+  dispatch(id: string, event: Event): Promise<Machine>;
 }
 ```
 
-**`registerDefinition`** — idempotent on `(id, version)`. Saves to the store, updates the catalog.
+**`register`** — idempotent on `(definition.id, definition.version)`. Saves to the store, updates the catalog.
 
-**`startMachine`** — fails if `machineId` already exists. Loads the specified definition (cache → store → error), creates a machine at `definition.initialState`, `revision: 0`, stamped with `(definitionId, definitionVersion)`, saves, returns. No event is applied; the machine is ready to receive its first real event via `dispatch`.
+**`start`** — fails if a machine with `params.id` already exists. Loads the specified definition (cache → store → error), creates a machine at `definition.initialState`, `revision: 0`, stamped with the `definition.id` / `definition.version` from the parameters, saves, returns. No event is applied; the machine is ready to receive its first real event via `dispatch`.
 
 **`dispatch`** — loads machine, looks up its definition (cache → store → error), applies `transition(...)`, bumps `revision`, saves with optimistic check, returns. Fails if the machine doesn't exist, the event has no matching transition, the machine is in a terminal state, or the revision conflicts.
 
@@ -239,8 +238,7 @@ Both JSON-serialize definitions and machines on save.
      ▼
    ┌────────────────────────────────────────────┐
    │  Application                               │
-   │    registerDefinition · startMachine       │
-   │    dispatch                                │
+   │    register · start · dispatch             │
    │                                            │
    │    (definition catalog, lazy-loaded)       │
    └────────────────┬───────────────────────────┘
@@ -277,29 +275,29 @@ async function createEngine(config: {
 
 Behavior:
 
-1. If `definitions` is provided, call `registerDefinition` for each.
-2. Returns an `Engine` exposing `registerDefinition`, `startMachine`, `dispatch`.
+1. If `definitions` is provided, call `register` for each.
+2. Returns an `Engine` exposing `register`, `start`, `dispatch`.
 
 ## Sequences
 
-### A. `startMachine`
+### A. `start`
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Caller
-    participant E as engine.startMachine
+    participant E as engine.start
     participant Cat as catalog
     participant S as Store
 
-    C->>E: startMachine(args)
-    E->>Cat: lookup(definitionId, version)
+    C->>E: start({ id, definition, context?, meta? })
+    E->>Cat: lookup(definition.id, definition.version)
     alt cache miss
-        E->>S: loadDefinition(id, version)
-        S-->>E: definition
+        E->>S: loadDefinition(definition.id, definition.version)
+        S-->>E: definition object
         E->>Cat: put(definition)
     end
-    E->>S: loadMachine(machineId)
+    E->>S: loadMachine(id)
     S-->>E: null
     E->>E: build machine at initialState, revision: 0
     E->>S: saveMachine(machine)
@@ -317,8 +315,8 @@ sequenceDiagram
     participant S as Store
     participant Dom as transition
 
-    C->>E: dispatch(machineId, event)
-    E->>S: loadMachine(machineId)
+    C->>E: dispatch(id, event)
+    E->>S: loadMachine(id)
     S-->>E: machine (revision R)
     E->>Cat: lookup(definitionId, version)
     Cat-->>E: definition
@@ -335,11 +333,11 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant C as Caller
-    participant E as engine.registerDefinition
+    participant E as engine.register
     participant S as Store
     participant Cat as catalog
 
-    C->>E: registerDefinition(def)
+    C->>E: register(def)
     E->>S: saveDefinition(def)
     Note over S: idempotent on (id, version)
     E->>Cat: put(def)
@@ -379,14 +377,14 @@ What this rules out (deliberately):
 - **I-6.** Engine reads only the structural fields it needs to route events and validate transitions (`id`, `state`, `from`, `to`, `event`, `terminal`, `version`, `revision`). All other fields — `payload`, `context`, `Machine.meta`, `State.label`, `State.meta`, `Transition.label`, `Transition.meta` — pass through unchanged.
 - **I-7.** Engine never reads `StateId` values for semantics; it only compares them as strings. Resolution to `State` objects is always scoped by `(definitionId, definitionVersion)`.
 - **I-8.** Every machine carries `(definitionId, definitionVersion)`. Dispatch uses that exact version; no silent upgrades.
-- **I-9.** `saveDefinition` and `registerDefinition` are idempotent on `(id, version)`.
+- **I-9.** `saveDefinition` and `register` are idempotent on `(id, version)`.
 - **I-10.** The catalog is a cache: any entry must be reconstructible from the store. Clearing the catalog never loses data.
 - **I-11.** `Machine.revision` is monotonically non-decreasing across the machine's lifetime. Every successful `dispatch` increments it by exactly 1. Conflicting writes are rejected.
 
 ## Tests we expect
 
 - **Domain tests** — `transition` against tables of `(state, event, definition) → state`. Pure, no I/O.
-- **Use-case tests** — `registerDefinition`, `startMachine`, `dispatch` with `MemoryStore`.
+- **Use-case tests** — `register`, `start`, `dispatch` with `MemoryStore`.
 - **Adapter contract tests** — run against `MemoryStore` and `SqliteStore`. Cover definition save/load, machine save/load, idempotent definition save, optimistic concurrency conflict.
 - **Payload-opacity tests** — round-trip arbitrary payload shapes.
 - **State-opacity tests** — configure with arbitrary random `StateId`s; behavior unchanged.
@@ -410,7 +408,7 @@ const engine = await createEngine({
 });
 
 // user creates a new playbook → orchestrator registers its definition
-await engine.registerDefinition({
+await engine.register({
   id: "playbook.user-123.tdd-workflow",
   version: "1",
   initialState: "Initializing",
@@ -430,11 +428,10 @@ await engine.registerDefinition({
 });
 
 // orchestrator starts a machine at the definition's initialState (no event applied)
-const machine = await engine.startMachine({
-  machineId: "run-abc",
-  definitionId: "playbook.user-123.tdd-workflow",
-  definitionVersion: "1",
-  initialContext: { brief: /* caller-defined */ },
+const machine = await engine.start({
+  id: "run-abc",
+  definition: { id: "playbook.user-123.tdd-workflow", version: "1" },
+  context: { brief: /* caller-defined */ },
 });
 // machine.state === "Initializing", revision === 0
 
