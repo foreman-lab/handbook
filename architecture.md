@@ -15,7 +15,11 @@ Two composition modes will exist (both deferred to later docs):
 - **Pipe** — sequential chain of units: `Unit A → Unit B → Unit C`. Unit B starts when Unit A reaches `Completed`.
 - **Expand** — a unit's `Working` state expands into a subtree of children units. The parent's `Working` completes when all children reach `Completed`.
 
-The basic version runs **one unit, linearly, no composition.** Everything else is future work.
+**Recursion is native.** Every child is itself a unit — same 5 states, same 4 signals, same shape. A child may be leaf (its `Working` does the actual work) or composite (its `Working` expands further). Depth is unbounded; the engine treats every level identically.
+
+**Signals are uniform.** Every signal has the same shape: `{ type, payload: unknown }`. The engine routes by `type`; payloads pass through unread. This makes design easy: one signal handler, one validation shape, one test pattern across all four states.
+
+The basic version runs **one unit, linearly, no composition.** A root unit where `Working` is leaf. Everything else — pipe, expand, nested composites, parallel children — is future work that extends this shape without changing it.
 
 ## Scope
 
