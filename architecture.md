@@ -49,9 +49,10 @@ The engine's job is fixed: "advance one machine's state when an event arrives, u
 3. **Guards** — boolean predicates on transitions.
 4. **Definition migration** — rules for advancing a machine from older definition versions.
 5. **Playbook's tree orchestrator** — pipe, expand, DFS — separate doc at orchestrator level.
-6. **Journal and replay** — crash-recovery log.
+6. **Journal and replay** — per-machine append-only event log for audit, replay, and crash recovery.
 7. **Parallel step processing** — concurrent machines under structured concurrency.
 8. **Transport layers** — MCP, CLI, or any adapter that translates inbound calls into engine invocations.
+9. **Observer** — caller-subscribable port that emits transition events. Enables real-time UIs, dashboards, and streaming tools. Pull integrations (GraphQL queries, REST reads) need no engine change; they wrap the `Store` directly.
 
 Each gets its own architecture doc when its turn comes.
 
@@ -83,13 +84,15 @@ type Event = {
 type StateNode = {
   id: State;
   terminal?: boolean;
-  // future: entry?, exit?, meta?, timeout?
+  meta?: Record<string, unknown>;   // caller-owned; engine never reads
+  // future (feature-specific): entry?, exit?, timeout?
 };
 
 type Transition = {
   from: State;
   event: string;
   to: State;
+  meta?: Record<string, unknown>;   // caller-owned; engine never reads
 };
 
 type MachineDefinition = {
@@ -136,6 +139,14 @@ Throws if no row matches, or if `machine.state` is a terminal node.
 The engine resolves `definition` on each dispatch by looking up the machine's `definitionId` and `definitionVersion` in the catalog, loading from the store lazily if not already cached.
 
 Later features extend step 2 with a **Router port** — at specific rows, the engine asks a caller-provided router for the next state instead of reading it from the row.
+
+### Payload storage — snapshot vs event log
+
+`Machine.context` is a **latest-wins snapshot**, keyed by event type. Dispatching a `plan` event stores `event.payload` at `context.plan`. A second `plan` event overwrites the first. The machine always carries one value per event type: the most recent.
+
+This is intentional. The snapshot is bounded and queryable; it tells you "where is this machine now" without list walking. Callers read `context.plan` on retry to feed the agent the previous plan; no history traversal needed.
+
+Full event history — every attempt, every payload, in order — belongs to the **Journal** (out-of-scope item 6). When the Journal ships, every dispatch appends an entry alongside the snapshot update. Context is the reduced state; Journal is the event stream. Both persistable, both queryable.
 
 ### Concurrency
 
@@ -338,9 +349,15 @@ The engine is deliberately minimal. Every future capability extends through one 
 1. **Generic types.** States, events, context, and metadata are all caller-defined data. The engine carries them, never interprets them.
 2. **Open event envelope.** `Event` requires `{type, payload}`. Callers may carry extra fields (`timestamp`, `correlationId`, `source`, etc.) by declaring a superset type in their own code. The engine reads only `type` and `payload`; it neither validates nor strips the rest.
 3. **`Store` as a port.** Any adapter that satisfies the interface works. Callers can **wrap** the port (decorator pattern) to add logging, metrics, encryption, retry, or caching without touching the engine or its shipped adapters.
-4. **Caller-owned `metadata` bag.** Every machine carries `metadata: Record<string, unknown>`. The engine never reads or writes its contents. Callers use it for iteration counters, deadlines, approval state, correlation data — anything specific to their domain.
-5. **Declared future ports.** The Out-of-scope list names the expected extension hooks (`Router`, `Actions`, `Guards`). Each becomes an optional port when it ships. Engines constructed without these ports fall back to the basic behavior; engines constructed with them gain the feature. Backward-compatible by construction.
+4. **Caller-owned metadata, everywhere.** Machines, state nodes, and transitions all carry `meta?: Record<string, unknown>` (or `metadata`). The engine never reads or writes their contents. Use them for: machine iteration counters and deadlines, state display names / descriptions / icons / colors for UIs, transition labels and reasons for operator docs — anything specific to the caller's domain.
+5. **Declared future ports.** The Out-of-scope list names the expected extension hooks (`Router`, `Actions`, `Guards`, `Observer`). Each becomes an optional port when it ships. Engines constructed without these ports fall back to the basic behavior; engines constructed with them gain the feature. Backward-compatible by construction.
 6. **Immutable bedrock.** The types, ports, and invariants documented here are the stable API. New ports are added in minor versions; fields can be added in minor versions; renames and removals require a major version and an ADR. Callers can rely on this contract.
+
+### UI and read-integrations
+
+Pull-style integrations (GraphQL, REST, CLI listing, documentation generators, diagram exporters) are **adapters around `Store`**, not engine changes. The store exposes `loadDefinition(id, version)` and `loadMachine(id)`; those are enough to serve any read API. Push-style integrations (dashboards, live timelines) use the future `Observer` port for transition events.
+
+For runtime-growing systems where users author many definitions, `StateNode.meta` and `Transition.meta` carry the display-layer data the engine refuses to invent — names, descriptions, icons, documentation links, whatever the UI needs. The engine persists them as opaque bags; the UI reads them through its adapter.
 
 What this rules out (deliberately):
 
@@ -355,7 +372,7 @@ What this rules out (deliberately):
 - **I-3.** An event is either applied (machine saved) or rejected (no state change).
 - **I-4.** Every outbound port has ≥2 implementations.
 - **I-5.** No `any` in domain; Zod gates every event's and definition's shape.
-- **I-6.** Engine never reads `payload`, `context`, or `metadata` content. They pass through unchanged.
+- **I-6.** Engine never reads `payload`, `context`, `metadata`, `StateNode.meta`, or `Transition.meta` content. They pass through unchanged.
 - **I-7.** Engine never reads state labels for semantics; it only compares them as strings.
 - **I-8.** Every machine carries `(definitionId, definitionVersion)`. Dispatch uses that exact version; no silent upgrades.
 - **I-9.** `saveDefinition` and `registerDefinition` are idempotent on `(id, version)`.
