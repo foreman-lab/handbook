@@ -6,7 +6,7 @@ Tied to [`foundations.md`](foundations.md).
 
 ## The model
 
-A **state** is a node in the graph — an identified position with optional metadata (is it terminal, and — later — entry/exit actions, timeouts). Caller-defined.
+A **state** is a node in the graph — an identified position with optional metadata (caller-typed `data`, label, and — later — entry/exit actions, timeouts). Terminality is derived: a state is terminal iff no outgoing transitions exist from it. Caller-defined.
 
 A **state id** (`StateId`) is a string identifier that references a state within a graph. It's scoped to its graph: the id `"Planning"` under one graph is a different state than `"Planning"` under another. Machines always carry their `graphId` + `graphVersion` alongside their current state id, so resolution is unambiguous.
 
@@ -26,6 +26,26 @@ The engine advances **one machine at a time**. Multi-machine orchestration — t
 
 The engine's job is fixed: "advance one machine's state when an event arrives, using whichever graph that machine belongs to." Everything else is caller work.
 
+### Why the engine doesn't model the tree directly
+
+A state machine has **one current state**; a Playbook tree has **many simultaneously active leaves** (root + every currently-executing child). These are structurally different things:
+
+- *State machine*: single cursor, event-driven, sequential per machine.
+- *Tree/DAG/pipeline*: structure of relationships, data-driven, often concurrent.
+
+Trying to model the tree as a giant state machine forces one of: (a) HSM with statically-declared parallel regions (fails on dynamic growth), (b) `Machine.state: StateId[]` (no longer a state machine — it's a workflow engine), or (c) one Machine per frontier subset (combinatorial explosion).
+
+The honest unification is **at the engine and pattern layers, not at the topology layer**:
+
+| Layer | Single | Notes |
+|---|---|---|
+| Persistence | one `Store` port | graphs + machines, both kinds |
+| Engine | one `transition`, one `Machine`, one `Graph` (with generics) | unchanged across orchestrator patterns |
+| Pattern | one hexagonal recipe | port → ≥2 adapters → shared contract suite |
+| Topology | many — tree / DAG / pipeline / scheduled | **each is a separate orchestrator module**, each is data riding on a Machine's `context` |
+
+Each orchestrator is a thin (~80 LOC) wrapper around `engine.dispatch` with policy hooks for spawn / readiness / completion. New topology = new orchestrator module, no engine change.
+
 ## Scope
 
 **In**
@@ -40,19 +60,19 @@ The engine's job is fixed: "advance one machine's state when an event arrives, u
 - **Optimistic concurrency** — each machine has a monotonic `revision`; conflicting writes are rejected.
 - Opaque payloads on events; engine never reads content.
 - One outbound port: `Store` (save / load graphs and machines).
+- One optional inbound port: `Router` — caller-supplied pure function `(machine, event, graph) → StateId` for dynamic transitions (retry loops, outcome routing, conditional branching). Routers are registered alongside their graph and live in-memory only.
 - Three use cases: `register`, `start`, `dispatch`.
 
 **Out (added in later docs)**
 
-1. **Router** — caller-provided port for dynamic transitions (retry loops, blocks, joins, approvals, timeouts all compose from it).
-2. **Entry / exit actions** — state- and transition-level side effects.
-3. **Guards** — boolean predicates on transitions.
-4. **Graph migration** — rules for advancing a machine from older graph versions.
-5. **Playbook's tree orchestrator** — pipe, expand, DFS — separate doc at orchestrator level.
-6. **Journal and replay** — per-machine append-only event log for audit, replay, and crash recovery.
-7. **Parallel step processing** — concurrent machines under structured concurrency.
-8. **Transport layers** — MCP, CLI, or any adapter that translates inbound calls into engine invocations.
-9. **Subscriber** — caller-provided port that receives transition events as they happen. Matches the Redux/RxJS/XState subscribe idiom. Enables real-time UIs, dashboards, and streaming tools. Pull integrations (GraphQL queries, REST reads) need no engine change; they wrap the `Store` directly.
+1. **Entry / exit actions** — state- and transition-level side effects.
+2. **Guards** — boolean predicates on transitions (subset of router; deferred until a real use case appears that the router can't already satisfy).
+3. **Graph migration** — rules for advancing a machine from older graph versions.
+4. **Playbook's tree orchestrator** — pipe, expand, DFS — separate doc at orchestrator level.
+5. **Journal and replay** — per-machine append-only event log for audit, replay, and crash recovery.
+6. **Parallel step processing** — concurrent machines under structured concurrency.
+7. **Transport layers** — MCP, CLI, or any adapter that translates inbound calls into engine invocations.
+8. **Subscriber** — caller-provided port that receives transition events as they happen. Matches the Redux/RxJS/XState subscribe idiom. Enables real-time UIs, dashboards, and streaming tools. Pull integrations (GraphQL queries, REST reads) need no engine change; they wrap the `Store` directly.
 
 Each gets its own architecture doc when its turn comes.
 
@@ -74,73 +94,115 @@ The basic engine simplifies both:
 ```ts
 type StateId = string;              // reference/pointer to a State within a graph
 
-type Event = {
+type Event<T = unknown> = {
   type: string;
-  payload: unknown;
+  payload: T;
 };
 // Callers MAY define a superset of Event (e.g., add `timestamp`, `correlationId`)
 // as long as `type` and `payload` remain present. The engine reads only those two.
 
-type State = {
+// Core types are parameterized with safe defaults so callers can opt into
+// stricter typing per graph without changing the engine. Defaults reduce to
+// `unknown` / `Record<string, unknown>`, preserving domain-blind opacity.
+
+type State<T = Record<string, unknown>> = {
   id: StateId;
   label?: string;                   // human-readable name for UIs, logs, docs
-  terminal?: boolean;
+  data?: T;                         // caller-typed per-state data; engine never reads
   meta?: Record<string, unknown>;   // caller-owned; engine never reads
   // future (feature-specific): entry?, exit?, timeout?
 };
+//
+// Note: there is NO `terminal: boolean` field. A state is terminal iff no
+// outgoing transitions exist from it. The engine derives terminality at
+// dispatch time — one source of truth, one less special case, one less
+// error class. (`TerminalStateError` collapses into `NoMatchingTransitionError`.)
 
-type Transition = {
+// A transition is EITHER static (fixed `to`) OR dynamic (a router decides `to`).
+// Both forms share `from`, `event`, `label?`, `meta?`.
+type Transition = StaticTransition | DynamicTransition;
+
+type StaticTransition = {
   from: StateId;                    // points to State.id in the same graph
   event: string;
-  to: StateId;
+  to: StateId;                      // fixed destination
   label?: string;                   // human-readable name for UIs, logs, docs
   meta?: Record<string, unknown>;   // caller-owned; engine never reads
 };
 
-type Graph = {
+type DynamicTransition = {
+  from: StateId;
+  event: string;
+  routerKey: string;                // resolves to a Router registered with this graph
+  label?: string;
+  meta?: Record<string, unknown>;
+};
+
+// A Router is a pure function that picks the next state from an open set.
+// Same inputs → same StateId. No I/O, no clock, no randomness — wrap deps
+// at register time if needed.
+type Router<
+  T = Record<string, unknown>,    // state data
+  U = Record<string, unknown>,    // machine context
+  V = unknown,                    // event payload
+> = (
+  machine: Machine<T, U>,
+  event: Event<V>,
+  graph: Graph<T>,
+) => StateId;
+
+type Graph<T = Record<string, unknown>> = {
   id: string;
   version: string;
   initialState: StateId;            // points to one of states[].id
-  states: State[];
+  states: State<T>[];
   transitions: Transition[];
 };
 
-type Machine = {
+type Machine<
+  T = Record<string, unknown>,    // state data
+  U = Record<string, unknown>,    // machine context
+> = {
   id: string;
   graphId: string;
   graphVersion: string;
   revision: number;                 // starts at 0; engine increments on each save
   state: StateId;                   // points to a State in graph.states
-  context: Record<string, unknown>;
+  context: U;                       // caller-typed; engine never reads
   meta: Record<string, unknown>;    // caller-owned; engine never reads
 };
 ```
 
-Every field is either primitive or `unknown`. The engine does not know Playbook's specific states, event types, or anything about `payload` content.
+Every field is either primitive or generic. The engine does not know Playbook's specific states, event types, or anything about `payload` / `context` content. Generics are pure DX — they let callers express type contracts without changing engine behavior. Defaulting all type parameters to `unknown` / `Record<string, unknown>` preserves the basic opacity guarantee for callers who don't care about per-graph typing.
 
 ### The step (how one event is processed)
 
 Every `dispatch` is three generic operations:
 
 1. **Update.** Store the event's payload into `context[event.type]`. Mechanical.
-2. **Transition.** Look up `(machine.state, event.type)` in the graph's transitions; return the next state.
+2. **Transition.** Look up `(machine.state, event.type)` in the graph's transitions:
+   - If the matched row is a `StaticTransition`, the next state is `row.to`.
+   - If the matched row is a `DynamicTransition`, the engine invokes the registered `Router` whose name matches `row.routerKey`, passing `(machine, event, graph)`. The router's return value is the next state. The engine validates that the returned `StateId` exists in the graph's `states[]`; otherwise it throws `UnknownStateError`.
 3. **Increment.** Bump `machine.revision` by 1 so the next save enforces the concurrency contract (see §Concurrency).
 
 Combined in one pure function:
 
 ```ts
-function transition(
-  machine: Machine,
-  event: Event,
-  graph: Graph,
-): Machine;
+function transition<
+  T = Record<string, unknown>,    // state data
+  U = Record<string, unknown>,    // machine context
+  V = unknown,                    // event payload
+>(
+  machine: Machine<T, U>,
+  event: Event<V>,
+  graph: Graph<T>,
+  routers?: Record<string, Router<T, U, V>>,
+): Machine<T, U>;
 ```
 
-Throws if no row matches, or if the `State` identified by `machine.state` is marked terminal.
+Throws if no row matches (the state is implicitly terminal — no outgoing transitions), if the matched row is dynamic and no router is registered for its `routerKey`, or if the router returns a `StateId` not in the graph. There is no separate "terminal state" check; "no matching transition" covers it.
 
-The engine resolves `graph` on each dispatch by looking up the machine's `graphId` and `graphVersion` in the catalog, loading from the store lazily if not already cached.
-
-Later features extend step 2 with a **Router port** — at specific rows, the engine asks a caller-provided router for the next state instead of reading it from the row.
+The engine resolves `graph` and `routers` on each dispatch by looking up the machine's `graphId` and `graphVersion` in the catalog, loading from the store lazily if not already cached. Routers are registered alongside their graph at `register` time and live in-memory only — they are functions, not serializable values.
 
 ### Payload storage — snapshot vs event log
 
@@ -180,8 +242,13 @@ Cache policy is adapter-agnostic in the basic version: caches forever unless exp
 
 ```ts
 interface Engine {
-  // Add or update a graph. Saves to the store and catalogs it.
-  register(graph: Graph): Promise<void>;
+  // Add or update a graph. Saves to the store and catalogs it. If the graph
+  // contains DynamicTransitions, `routers` MUST supply a function for every
+  // referenced `routerKey`; otherwise register throws InvalidGraphError.
+  register(
+    graph: Graph,
+    options?: { routers?: Record<string, Router> },
+  ): Promise<void>;
 
   // Create a new machine under a specific graph at its initialState.
   // Does NOT apply an event. Use dispatch for the first state change.
@@ -192,16 +259,18 @@ interface Engine {
     meta?: Record<string, unknown>;                 // initial meta (optional)
   }): Promise<Machine>;
 
-  // Advance an existing machine. Resolves its graph lazily from the catalog.
+  // Advance an existing machine. Resolves its graph + routers lazily from the catalog.
   dispatch(id: string, event: Event): Promise<Machine>;
 }
 ```
+
+Routers travel **with their graph** (registered together, indexed by `(graphId, graphVersion)` in the catalog) but are **never persisted** — they are functions, not data. On a fresh process, the catalog is empty until callers re-register graphs with their routers; lazy loading from the `Store` recovers the graph but a graph with `DynamicTransition`s cannot be dispatched until its routers are also re-registered.
 
 **`register`** — idempotent on `(graph.id, graph.version)`. Saves to the store, updates the catalog.
 
 **`start`** — fails if a machine with `params.id` already exists. Loads the specified graph (cache → store → error), creates a machine at `graph.initialState`, `revision: 0`, stamped with the `graph.id` / `graph.version` from the parameters, saves, returns. No event is applied; the machine is ready to receive its first real event via `dispatch`.
 
-**`dispatch`** — loads machine, looks up its graph (cache → store → error), applies `transition(...)`, bumps `revision`, saves with optimistic check, returns. Fails if the machine doesn't exist, the event has no matching transition, the machine is in a terminal state, or the revision conflicts.
+**`dispatch`** — loads machine, looks up its graph (cache → store → error), applies `transition(...)`, bumps `revision`, saves with optimistic check, returns. Fails if the machine doesn't exist, the event has no matching transition (which subsumes the terminal-state case — terminal states have no outgoing transitions by definition), or the revision conflicts.
 
 ### Outbound port: `Store`
 
@@ -319,8 +388,9 @@ sequenceDiagram
     E->>S: loadMachine(id)
     S-->>E: machine (revision R)
     E->>Cat: lookup(graphId, version)
-    Cat-->>E: graph
-    E->>Dom: transition(machine, event, graph)
+    Cat-->>E: graph + routers
+    E->>Dom: transition(machine, event, graph, routers)
+    Note over Dom: matched row is dynamic →<br/>call routers[row.routerKey](m, e, g)<br/>validate returned StateId in graph.states
     Dom-->>E: new machine (revision R+1)
     E->>S: saveMachine(new machine)
     S-->>E: ok (or ConcurrencyConflictError if stored != R)
@@ -370,16 +440,18 @@ What this rules out (deliberately):
 ## Invariants
 
 - **I-1.** Domain files (`types`, `schemas`, `transition`, `errors`) import nothing outside `src/graph/` domain set.
-- **I-2.** `transition` is pure: same `(machine, event, graph)` → same result.
+- **I-2.** `transition` is pure: same `(machine, event, graph, routers)` → same result. Routers MUST themselves be pure (see I-12).
 - **I-3.** An event is either applied (machine saved) or rejected (no state change).
 - **I-4.** Every outbound port has ≥2 implementations.
 - **I-5.** No `any` in domain; Zod gates every event's and graph's shape.
-- **I-6.** Engine reads only the structural fields it needs to route events and validate transitions (`id`, `state`, `from`, `to`, `event`, `terminal`, `version`, `revision`). All other fields — `payload`, `context`, `Machine.meta`, `State.label`, `State.meta`, `Transition.label`, `Transition.meta` — pass through unchanged.
+- **I-6.** Engine reads only the structural fields it needs to route events and validate transitions (`id`, `state`, `from`, `to`, `routerKey`, `event`, `version`, `revision`). All other fields — `payload`, `context`, `Machine.meta`, `State.label`, `State.data`, `State.meta`, `Transition.label`, `Transition.meta` — pass through unchanged. Router functions may inspect any field (they are caller-defined), but the engine itself never interprets the opaque ones. Terminality is derived from "no outgoing transitions"; not a stored field.
 - **I-7.** Engine never reads `StateId` values for semantics; it only compares them as strings. Resolution to `State` objects is always scoped by `(graphId, graphVersion)`.
 - **I-8.** Every machine carries `(graphId, graphVersion)`. Dispatch uses that exact version; no silent upgrades.
 - **I-9.** `saveGraph` and `register` are idempotent on `(id, version)`.
 - **I-10.** The catalog is a cache: any entry must be reconstructible from the store. Clearing the catalog never loses data.
 - **I-11.** `Machine.revision` is monotonically non-decreasing across the machine's lifetime. Every successful `dispatch` increments it by exactly 1. Conflicting writes are rejected.
+- **I-12.** Routers are pure: same `(machine, event, graph)` → same `StateId`. No I/O, no clock, no randomness. Wrap dependencies at register time if the routing rule needs them.
+- **I-13.** Routers are not persistable. They live in-memory only, scoped to `(graphId, graphVersion)` in the catalog. A graph that uses any `DynamicTransition` is undispatchable until its routers are registered in the current process.
 
 ## Tests we expect
 
@@ -393,8 +465,12 @@ What this rules out (deliberately):
 - **Runtime-registration tests** — start with empty catalog; register at runtime; dispatch against it.
 - **Multi-version tests** — two versions of one id coexist; machines advance under their respective versions.
 - **Concurrency-conflict tests** — simulate a stale write; assert the conflict is raised and no state changes.
-- **Terminal-state tests** — events into terminal machines are rejected.
+- **Terminal-state tests** — events dispatched to a state with no outgoing transitions are rejected with `NoMatchingTransitionError` (terminality is derived; no separate flag).
 - **Missing-graph tests** — dispatch against a machine whose graph is neither cached nor stored; clean error.
+- **Router tests** — `transition` against a graph with one `DynamicTransition`: the registered router is invoked with `(machine, event, graph)` and its return is the new state.
+- **Router purity tests** — same inputs to a router → same output, with no observable side effects.
+- **Missing-router tests** — register a graph with `DynamicTransition` and no matching router → `InvalidGraphError`. Dispatch against a graph whose routers haven't been re-registered after a process restart → clean error (e.g., `MissingRouterError`).
+- **Router output validation tests** — a router returning a `StateId` not in `graph.states` → `UnknownStateError` from the engine, no state change.
 - **Store-decorator test** — wrap `MemoryStore` with a logging decorator; engine behavior unchanged; log captures calls.
 
 ## Appendix: Playbook's configuration (example)
@@ -417,14 +493,32 @@ await engine.register({
     { id: "Planning",     label: "Planning" },
     { id: "Working",      label: "Executing" },
     { id: "Evaluating",   label: "Evaluating" },
-    { id: "Completed",    label: "Done", terminal: true },
+    { id: "Completed",    label: "Done"     },     // no outgoing transitions → terminal
+    { id: "Blocked",      label: "Blocked"  },     // no outgoing transitions → terminal
   ],
   transitions: [
-    { from: "Initializing", event: "plan", to: "Planning",   label: "Propose plan" },
-    { from: "Planning",     event: "work", to: "Working",    label: "Start work" },
-    { from: "Working",      event: "eval", to: "Evaluating", label: "Submit evaluation" },
-    { from: "Evaluating",   event: "eval", to: "Completed",  label: "Finalize" },
+    { from: "Initializing", event: "plan", to: "Planning",      label: "Propose plan" },
+    { from: "Planning",     event: "work", to: "Working",       label: "Start work" },
+    { from: "Working",      event: "eval", to: "Evaluating",    label: "Submit evaluation" },
+    // Outcome routing: ONE event ("decide"), the router picks the next state
+    // from the evaluation payload. Replaces the prior pseudo-events
+    // (pass/retry/block) that pushed outcome derivation into the orchestrator.
+    { from: "Evaluating",   event: "decide", routerKey: "evalRouter", label: "Route by outcome" },
   ],
+}, {
+  routers: {
+    evalRouter: (machine, event, _graph) => {
+      const evaluation = event.payload as {
+        meetsCriteria: boolean;
+        findings: { severity: string }[];
+      };
+      const retryCount = (machine.meta.retryCount as number) ?? 0;
+      if (evaluation.findings.some((f) => f.severity === "critical")) return "Blocked";
+      if (evaluation.meetsCriteria) return "Completed";
+      if (retryCount >= 3) return "Blocked";
+      return "Planning";   // back-edge for retry
+    },
+  },
 });
 
 // orchestrator starts a machine at the graph's initialState (no event applied)
