@@ -94,9 +94,9 @@ The basic engine simplifies both:
 ```ts
 type StateId = string;              // reference/pointer to a State within a graph
 
-type Event<EventPayload = unknown> = {
+type Event<T = unknown> = {
   type: string;
-  payload: EventPayload;
+  payload: T;
 };
 // Callers MAY define a superset of Event (e.g., add `timestamp`, `correlationId`)
 // as long as `type` and `payload` remain present. The engine reads only those two.
@@ -105,10 +105,10 @@ type Event<EventPayload = unknown> = {
 // stricter typing per graph without changing the engine. Defaults reduce to
 // `unknown` / `Record<string, unknown>`, preserving domain-blind opacity.
 
-type State<StateData = Record<string, unknown>> = {
+type State<T = Record<string, unknown>> = {
   id: StateId;
   label?: string;                   // human-readable name for UIs, logs, docs
-  data?: StateData;                 // caller-typed per-state data; engine never reads
+  data?: T;                         // caller-typed per-state data; engine never reads
   meta?: Record<string, unknown>;   // caller-owned; engine never reads
   // future (feature-specific): entry?, exit?, timeout?
 };
@@ -142,33 +142,33 @@ type DynamicTransition = {
 // Same inputs → same StateId. No I/O, no clock, no randomness — wrap deps
 // at register time if needed.
 type Router<
-  StateData = Record<string, unknown>,
-  MachineContext = Record<string, unknown>,
-  EventPayload = unknown,
+  T = Record<string, unknown>,    // state data
+  U = Record<string, unknown>,    // machine context
+  V = unknown,                    // event payload
 > = (
-  machine: Machine<StateData, MachineContext>,
-  event: Event<EventPayload>,
-  graph: Graph<StateData>,
+  machine: Machine<T, U>,
+  event: Event<V>,
+  graph: Graph<T>,
 ) => StateId;
 
-type Graph<StateData = Record<string, unknown>> = {
+type Graph<T = Record<string, unknown>> = {
   id: string;
   version: string;
   initialState: StateId;            // points to one of states[].id
-  states: State<StateData>[];
+  states: State<T>[];
   transitions: Transition[];
 };
 
 type Machine<
-  StateData = Record<string, unknown>,
-  MachineContext = Record<string, unknown>,
+  T = Record<string, unknown>,    // state data
+  U = Record<string, unknown>,    // machine context
 > = {
   id: string;
   graphId: string;
   graphVersion: string;
   revision: number;                 // starts at 0; engine increments on each save
   state: StateId;                   // points to a State in graph.states
-  context: MachineContext;          // caller-typed; engine never reads
+  context: U;                       // caller-typed; engine never reads
   meta: Record<string, unknown>;    // caller-owned; engine never reads
 };
 ```
@@ -189,15 +189,15 @@ Combined in one pure function:
 
 ```ts
 function transition<
-  StateData = Record<string, unknown>,
-  MachineContext = Record<string, unknown>,
-  EventPayload = unknown,
+  T = Record<string, unknown>,    // state data
+  U = Record<string, unknown>,    // machine context
+  V = unknown,                    // event payload
 >(
-  machine: Machine<StateData, MachineContext>,
-  event: Event<EventPayload>,
-  graph: Graph<StateData>,
-  routers?: Record<string, Router<StateData, MachineContext, EventPayload>>,
-): Machine<StateData, MachineContext>;
+  machine: Machine<T, U>,
+  event: Event<V>,
+  graph: Graph<T>,
+  routers?: Record<string, Router<T, U, V>>,
+): Machine<T, U>;
 ```
 
 Throws if no row matches (the state is implicitly terminal — no outgoing transitions), if the matched row is dynamic and no router is registered for its `routerKey`, or if the router returns a `StateId` not in the graph. There is no separate "terminal state" check; "no matching transition" covers it.
