@@ -6,7 +6,7 @@ Tied to [`foundations.md`](foundations.md).
 
 ## The model
 
-A **state** is a node in the graph — an identified position with optional metadata (is it terminal, and — later — entry/exit actions, timeouts). Caller-defined.
+A **state** is a node in the graph — an identified position with optional metadata (caller-typed `data`, label, and — later — entry/exit actions, timeouts). Terminality is derived: a state is terminal iff no outgoing transitions exist from it. Caller-defined.
 
 A **state id** (`StateId`) is a string identifier that references a state within a graph. It's scoped to its graph: the id `"Planning"` under one graph is a different state than `"Planning"` under another. Machines always carry their `graphId` + `graphVersion` alongside their current state id, so resolution is unambiguous.
 
@@ -25,6 +25,26 @@ The engine maintains a **graph catalog** that grows over time. Graphs are **pers
 The engine advances **one machine at a time**. Multi-machine orchestration — tree, DAG, pipeline, parallel — lives in an orchestrator above the engine. Playbook's tree orchestrator is one such caller; tests, debuggers, future tools are others.
 
 The engine's job is fixed: "advance one machine's state when an event arrives, using whichever graph that machine belongs to." Everything else is caller work.
+
+### Why the engine doesn't model the tree directly
+
+A state machine has **one current state**; a Playbook tree has **many simultaneously active leaves** (root + every currently-executing child). These are structurally different things:
+
+- *State machine*: single cursor, event-driven, sequential per machine.
+- *Tree/DAG/pipeline*: structure of relationships, data-driven, often concurrent.
+
+Trying to model the tree as a giant state machine forces one of: (a) HSM with statically-declared parallel regions (fails on dynamic growth), (b) `Machine.state: StateId[]` (no longer a state machine — it's a workflow engine), or (c) one Machine per frontier subset (combinatorial explosion).
+
+The honest unification is **at the engine and pattern layers, not at the topology layer**:
+
+| Layer | Single | Notes |
+|---|---|---|
+| Persistence | one `Store` port | graphs + machines, both kinds |
+| Engine | one `transition`, one `Machine`, one `Graph` (with generics) | unchanged across orchestrator patterns |
+| Pattern | one hexagonal recipe | port → ≥2 adapters → shared contract suite |
+| Topology | many — tree / DAG / pipeline / scheduled | **each is a separate orchestrator module**, each is data riding on a Machine's `context` |
+
+Each orchestrator is a thin (~80 LOC) wrapper around `engine.dispatch` with policy hooks for spawn / readiness / completion. New topology = new orchestrator module, no engine change.
 
 ## Scope
 
@@ -74,20 +94,29 @@ The basic engine simplifies both:
 ```ts
 type StateId = string;              // reference/pointer to a State within a graph
 
-type Event = {
+type Event<P = unknown> = {
   type: string;
-  payload: unknown;
+  payload: P;
 };
 // Callers MAY define a superset of Event (e.g., add `timestamp`, `correlationId`)
 // as long as `type` and `payload` remain present. The engine reads only those two.
 
-type State = {
+// Core types are parameterized with safe defaults so callers can opt into
+// stricter typing per graph without changing the engine. Defaults reduce to
+// `unknown` / `Record<string, unknown>`, preserving domain-blind opacity.
+
+type State<D = Record<string, unknown>> = {
   id: StateId;
   label?: string;                   // human-readable name for UIs, logs, docs
-  terminal?: boolean;
+  data?: D;                         // caller-typed per-state data; engine never reads
   meta?: Record<string, unknown>;   // caller-owned; engine never reads
   // future (feature-specific): entry?, exit?, timeout?
 };
+//
+// Note: there is NO `terminal: boolean` field. A state is terminal iff no
+// outgoing transitions exist from it. The engine derives terminality at
+// dispatch time — one source of truth, one less special case, one less
+// error class. (`TerminalStateError` collapses into `NoMatchingTransitionError`.)
 
 // A transition is EITHER static (fixed `to`) OR dynamic (a router decides `to`).
 // Both forms share `from`, `event`, `label?`, `meta?`.
@@ -112,28 +141,35 @@ type DynamicTransition = {
 // A Router is a pure function that picks the next state from an open set.
 // Same inputs → same StateId. No I/O, no clock, no randomness — wrap deps
 // at register time if needed.
-type Router = (machine: Machine, event: Event, graph: Graph) => StateId;
+type Router<
+  D = Record<string, unknown>,
+  Ctx = Record<string, unknown>,
+  P = unknown,
+> = (machine: Machine<D, Ctx>, event: Event<P>, graph: Graph<D>) => StateId;
 
-type Graph = {
+type Graph<D = Record<string, unknown>> = {
   id: string;
   version: string;
   initialState: StateId;            // points to one of states[].id
-  states: State[];
+  states: State<D>[];
   transitions: Transition[];
 };
 
-type Machine = {
+type Machine<
+  D = Record<string, unknown>,
+  Ctx = Record<string, unknown>,
+> = {
   id: string;
   graphId: string;
   graphVersion: string;
   revision: number;                 // starts at 0; engine increments on each save
   state: StateId;                   // points to a State in graph.states
-  context: Record<string, unknown>;
+  context: Ctx;                     // caller-typed; engine never reads
   meta: Record<string, unknown>;    // caller-owned; engine never reads
 };
 ```
 
-Every field is either primitive or `unknown`. The engine does not know Playbook's specific states, event types, or anything about `payload` content.
+Every field is either primitive or generic. The engine does not know Playbook's specific states, event types, or anything about `payload` / `context` content. Generics are pure DX — they let callers express type contracts without changing engine behavior. Defaulting all type parameters to `unknown` / `Record<string, unknown>` preserves the basic opacity guarantee for callers who don't care about per-graph typing.
 
 ### The step (how one event is processed)
 
@@ -148,15 +184,15 @@ Every `dispatch` is three generic operations:
 Combined in one pure function:
 
 ```ts
-function transition(
-  machine: Machine,
-  event: Event,
-  graph: Graph,
-  routers?: Record<string, Router>,
-): Machine;
+function transition<D = ..., Ctx = ..., P = unknown>(
+  machine: Machine<D, Ctx>,
+  event: Event<P>,
+  graph: Graph<D>,
+  routers?: Record<string, Router<D, Ctx, P>>,
+): Machine<D, Ctx>;
 ```
 
-Throws if no row matches, if the matched row is dynamic and no router is registered for its `routerKey`, if the router returns a `StateId` not in the graph, or if the `State` identified by `machine.state` is marked terminal.
+Throws if no row matches (the state is implicitly terminal — no outgoing transitions), if the matched row is dynamic and no router is registered for its `routerKey`, or if the router returns a `StateId` not in the graph. There is no separate "terminal state" check; "no matching transition" covers it.
 
 The engine resolves `graph` and `routers` on each dispatch by looking up the machine's `graphId` and `graphVersion` in the catalog, loading from the store lazily if not already cached. Routers are registered alongside their graph at `register` time and live in-memory only — they are functions, not serializable values.
 
@@ -226,7 +262,7 @@ Routers travel **with their graph** (registered together, indexed by `(graphId, 
 
 **`start`** — fails if a machine with `params.id` already exists. Loads the specified graph (cache → store → error), creates a machine at `graph.initialState`, `revision: 0`, stamped with the `graph.id` / `graph.version` from the parameters, saves, returns. No event is applied; the machine is ready to receive its first real event via `dispatch`.
 
-**`dispatch`** — loads machine, looks up its graph (cache → store → error), applies `transition(...)`, bumps `revision`, saves with optimistic check, returns. Fails if the machine doesn't exist, the event has no matching transition, the machine is in a terminal state, or the revision conflicts.
+**`dispatch`** — loads machine, looks up its graph (cache → store → error), applies `transition(...)`, bumps `revision`, saves with optimistic check, returns. Fails if the machine doesn't exist, the event has no matching transition (which subsumes the terminal-state case — terminal states have no outgoing transitions by definition), or the revision conflicts.
 
 ### Outbound port: `Store`
 
@@ -400,7 +436,7 @@ What this rules out (deliberately):
 - **I-3.** An event is either applied (machine saved) or rejected (no state change).
 - **I-4.** Every outbound port has ≥2 implementations.
 - **I-5.** No `any` in domain; Zod gates every event's and graph's shape.
-- **I-6.** Engine reads only the structural fields it needs to route events and validate transitions (`id`, `state`, `from`, `to`, `routerKey`, `event`, `terminal`, `version`, `revision`). All other fields — `payload`, `context`, `Machine.meta`, `State.label`, `State.meta`, `Transition.label`, `Transition.meta` — pass through unchanged. Router functions may inspect any field (they are caller-defined), but the engine itself never interprets the opaque ones.
+- **I-6.** Engine reads only the structural fields it needs to route events and validate transitions (`id`, `state`, `from`, `to`, `routerKey`, `event`, `version`, `revision`). All other fields — `payload`, `context`, `Machine.meta`, `State.label`, `State.data`, `State.meta`, `Transition.label`, `Transition.meta` — pass through unchanged. Router functions may inspect any field (they are caller-defined), but the engine itself never interprets the opaque ones. Terminality is derived from "no outgoing transitions"; not a stored field.
 - **I-7.** Engine never reads `StateId` values for semantics; it only compares them as strings. Resolution to `State` objects is always scoped by `(graphId, graphVersion)`.
 - **I-8.** Every machine carries `(graphId, graphVersion)`. Dispatch uses that exact version; no silent upgrades.
 - **I-9.** `saveGraph` and `register` are idempotent on `(id, version)`.
@@ -421,7 +457,7 @@ What this rules out (deliberately):
 - **Runtime-registration tests** — start with empty catalog; register at runtime; dispatch against it.
 - **Multi-version tests** — two versions of one id coexist; machines advance under their respective versions.
 - **Concurrency-conflict tests** — simulate a stale write; assert the conflict is raised and no state changes.
-- **Terminal-state tests** — events into terminal machines are rejected.
+- **Terminal-state tests** — events dispatched to a state with no outgoing transitions are rejected with `NoMatchingTransitionError` (terminality is derived; no separate flag).
 - **Missing-graph tests** — dispatch against a machine whose graph is neither cached nor stored; clean error.
 - **Router tests** — `transition` against a graph with one `DynamicTransition`: the registered router is invoked with `(machine, event, graph)` and its return is the new state.
 - **Router purity tests** — same inputs to a router → same output, with no observable side effects.
@@ -449,8 +485,8 @@ await engine.register({
     { id: "Planning",     label: "Planning" },
     { id: "Working",      label: "Executing" },
     { id: "Evaluating",   label: "Evaluating" },
-    { id: "Completed",    label: "Done",     terminal: true },
-    { id: "Blocked",      label: "Blocked",  terminal: true },
+    { id: "Completed",    label: "Done"     },     // no outgoing transitions → terminal
+    { id: "Blocked",      label: "Blocked"  },     // no outgoing transitions → terminal
   ],
   transitions: [
     { from: "Initializing", event: "plan", to: "Planning",      label: "Propose plan" },
